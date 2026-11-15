@@ -1,7 +1,7 @@
 # Multi-stage build for the sendbox-fleet server.
 # Base images are pinned by digest; update tag and digest together.
 
-FROM rust:1.93.1-slim-trixie@sha256:c0a38f5662afdb298898da1d70b909af4bda4e0acff2dc52aea6360a9b9c6956 AS build
+FROM rust:1.100.0-slim-trixie@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a AS build
 WORKDIR /src
 # rust-toolchain.toml is intentionally not copied: the image already provides
 # the pinned toolchain and the build does not need clippy or rustfmt.

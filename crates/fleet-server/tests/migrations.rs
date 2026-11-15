@@ -7,6 +7,7 @@
 
 use fleet_server::config::{DatabaseKind, DatabaseUrl};
 use fleet_server::db::Database;
+use sqlx::AssertSqlSafe;
 
 const TABLES: [&str; 12] = [
     "api_tokens",
@@ -53,16 +54,30 @@ async fn database() -> Database {
 
 async fn exec(database: &Database, sql: &str) -> Result<(), sqlx::Error> {
     match database {
-        Database::Postgres(pool) => sqlx::raw_sql(sql).execute(pool).await.map(drop),
-        Database::Sqlite(pool) => sqlx::raw_sql(sql).execute(pool).await.map(drop),
+        Database::Postgres(pool) => sqlx::raw_sql(AssertSqlSafe(sql.to_owned()))
+            .execute(pool)
+            .await
+            .map(drop),
+        Database::Sqlite(pool) => sqlx::raw_sql(AssertSqlSafe(sql.to_owned()))
+            .execute(pool)
+            .await
+            .map(drop),
     }
 }
 
 async fn count(database: &Database, table: &str) -> i64 {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     match database {
-        Database::Postgres(pool) => sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await,
-        Database::Sqlite(pool) => sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await,
+        Database::Postgres(pool) => {
+            sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql.clone()))
+                .fetch_one(pool)
+                .await
+        }
+        Database::Sqlite(pool) => {
+            sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql.clone()))
+                .fetch_one(pool)
+                .await
+        }
     }
     .unwrap()
 }
