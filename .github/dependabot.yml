@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Keeps the sendbox-governance contract on the latest sendbox `main` commit.
+  # See docs/contract.md.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: daily
+    allow:
+      - dependency-name: sendbox-governance
+    commit-message:
+      prefix: "Bump contract"
