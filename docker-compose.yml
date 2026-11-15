@@ -1,0 +1,54 @@
+# Local stack: PostgreSQL plus the fleet server.
+#   cp .env.example .env    # then set POSTGRES_PASSWORD
+#   docker compose build --no-cache && docker compose up
+name: sendbox-fleet
+
+services:
+  postgres:
+    image: postgres:18.7-alpine3.24@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sendbox_fleet}
+      POSTGRES_USER: ${POSTGRES_USER:-sendbox_fleet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - backend
+
+  fleet:
+    build: .
+    image: sendbox-fleet:dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      FLEET_BIND: 0.0.0.0:8080
+      # POSTGRES_PASSWORD must be URL-safe or percent-encoded.
+      FLEET_DATABASE_URL: postgres://${POSTGRES_USER:-sendbox_fleet}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-sendbox_fleet}
+      FLEET_LOG_DIR: /var/log/sendbox-fleet
+      FLEET_LOG_LEVEL: ${FLEET_LOG_LEVEL:-info}
+      FLEET_LOG_RETENTION_DAYS: ${FLEET_LOG_RETENTION_DAYS:-30}
+    ports:
+      - "127.0.0.1:${FLEET_PORT:-8080}:8080"
+    volumes:
+      - fleet-logs:/var/log/sendbox-fleet
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+volumes:
+  postgres-data:
+  fleet-logs:
+
+networks:
+  backend:

@@ -1,0 +1,9 @@
+.git/
+.github/
+.env
+target/
+logs/
+docs/
+*.db
+*.db-shm
+*.db-wal

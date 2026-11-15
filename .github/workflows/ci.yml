@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Format, lint, and test (SQLite)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustc --version --verbose
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --workspace
+
+  postgres:
+    name: Migrations and server (PostgreSQL)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18.7-alpine3.24@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+        env:
+          POSTGRES_DB: sendbox_fleet_test
+          POSTGRES_USER: sendbox_fleet
+          # Ephemeral, job-local database reachable only from this runner.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sendbox_fleet -d sendbox_fleet_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      FLEET_TEST_DATABASE_URL: postgres://sendbox_fleet@localhost:5432/sendbox_fleet_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustc --version --verbose
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Run migration tests against PostgreSQL
+        run: cargo test --locked --workspace --test migrations -- --test-threads=1
+
+      - name: Start the server against PostgreSQL and stop it gracefully
+        env:
+          FLEET_DATABASE_URL: ${{ env.FLEET_TEST_DATABASE_URL }}
+          FLEET_LOG_DIR: ${{ runner.temp }}/fleet-logs
+        run: |
+          cargo build --locked --bin sendbox-fleet
+          ./target/debug/sendbox-fleet &
+          server=$!
+          for _ in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null && break
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:8080/readyz
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --request POST http://127.0.0.1:8080/v1/authorize)
+          test "$status" = 401
+          kill -TERM "$server"
+          wait "$server"
+          ls -l "$FLEET_LOG_DIR"/sendbox-fleet.*.log
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-audit@0.23.0
+
+      - name: Audit Cargo.lock
+        run: cargo audit --deny warnings
