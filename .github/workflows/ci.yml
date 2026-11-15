@@ -40,6 +40,11 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace
 
+      # Last, so a pull request tracking a sendbox branch still gets every
+      # other result; this step then keeps it from merging (docs/contract.md).
+      - name: Check the contract is pinned to sendbox main
+        run: scripts/check-contract-pin.sh
+
   postgres:
     name: Migrations and server (PostgreSQL)
     runs-on: ubuntu-24.04

@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   contract-pin:
-    name: Auto-merge sendbox-governance pin updates
+    name: Auto-merge sendbox contract pin updates
     if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'mbianchidev/sendbox-fleet'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -19,9 +19,27 @@ jobs:
         id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
+      # Only pull requests that update nothing but the contract crates.
+      - name: Check the updated dependencies
+        id: scope
+        env:
+          NAMES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          contract=true
+          IFS=',' read -ra names <<< "$NAMES"
+          [ "${#names[@]}" -gt 0 ] || contract=false
+          for name in "${names[@]}"; do
+            case "${name// /}" in
+              sendbox-governance | sendbox-security) ;;
+              *) contract=false ;;
+            esac
+          done
+          echo "Updated: ${NAMES:-nothing}; contract only: $contract"
+          echo "contract=$contract" >> "$GITHUB_OUTPUT"
+
       # Branch protection holds the merge until every required CI job passes.
       - name: Enable auto-merge
-        if: steps.metadata.outputs.dependency-names == 'sendbox-governance'
+        if: steps.scope.outputs.contract == 'true'
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}

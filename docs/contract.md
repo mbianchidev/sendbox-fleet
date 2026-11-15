@@ -12,30 +12,42 @@ redefining any of those types.
 ```toml
 # Cargo.toml (workspace)
 sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", branch = "main" }
+sendbox-security = { git = "https://github.com/mbianchidev/sendbox", branch = "main" }
 ```
+
+`sendbox-security` supplies the signing envelope and trust store used for
+profile signatures and audit heads.
 
 - The dependency tracks sendbox `main`, and `Cargo.lock` records the exact
   commit. CI builds with `--locked`, so every build sees the same contract
   until the lockfile moves.
 - [Dependabot](../.github/dependabot.yml) checks sendbox `main` daily and opens
-  a pull request that moves `Cargo.lock` to the latest commit. The
+  one pull request (group `sendbox-contract`) that moves `Cargo.lock` to the
+  latest commit. The
   [auto-merge workflow](../.github/workflows/dependabot-auto-merge.yml) enables
-  auto-merge on those pull requests, and branch protection merges them only
-  after every CI job passes. A contract change that breaks this service leaves
-  the pull request open with failing checks for a maintainer to fix.
-- `sendbox-governance` inherits versions from the sendbox workspace and
-  depends on `sendbox-core` by path; Cargo resolves both from the same git
-  checkout.
+  auto-merge when that pull request updates nothing but `sendbox-governance`
+  and `sendbox-security`, and branch protection merges it only after every CI
+  job passes. A contract change that breaks this service leaves the pull
+  request open with failing checks for a maintainer to fix.
+- Both crates inherit versions from the sendbox workspace and depend on
+  `sendbox-core` by path; Cargo resolves all three from the same git checkout,
+  so they always share one commit.
 - Only `main` is tracked, so the recorded commit cannot disappear when sendbox
   feature branches are rewritten or deleted. A pull request that needs an
   unmerged contract change may track the sendbox pull request branch while
-  both are in review; it must move back to `main` before it merges.
+  both are in review. CI's last step,
+  [`scripts/check-contract-pin.sh`](../scripts/check-contract-pin.sh), fails
+  until every SendBox crate is locked to a sendbox `main` commit again (it also
+  rejects `rev`/`tag` pins and local path patches), so such a pull request
+  cannot merge. After the sendbox pull request merges, set `branch = "main"`
+  and run `cargo update -p sendbox-governance -p sendbox-security`.
 
 To move the lockfile by hand, to the latest `main` commit or to a specific one:
 
 ```sh
-cargo update -p sendbox-governance
-cargo update -p sendbox-governance --precise <commit-sha>
+cargo update -p sendbox-governance -p sendbox-security
+cargo update -p sendbox-governance --precise <commit-sha>   # moves all three crates
+scripts/check-contract-pin.sh
 cargo test --locked --workspace
 ```
 

@@ -122,6 +122,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 cargo audit --deny warnings          # needs cargo-audit; see .cargo/audit.toml
+scripts/check-contract-pin.sh        # SendBox crates locked to sendbox main
 ```
 
 Tests use in-memory SQLite and synthetic data. To run the migration and API
