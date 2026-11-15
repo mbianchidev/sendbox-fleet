@@ -63,6 +63,34 @@ impl Problem {
         Self::new(StatusCode::NOT_FOUND, "no resource exists at this path")
     }
 
+    /// A named resource that does not exist.
+    #[must_use]
+    pub fn missing(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, detail)
+    }
+
+    /// The caller is authenticated but not authorized for this operation.
+    #[must_use]
+    pub fn forbidden(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, detail)
+    }
+
+    /// The request conflicts with current state, such as a stale profile
+    /// revision or an exception that was already decided.
+    #[must_use]
+    pub fn conflict(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, detail)
+    }
+
+    /// An internal failure. The cause is logged, never returned.
+    #[must_use]
+    pub fn internal() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the request could not be completed; see the service logs",
+        )
+    }
+
     #[must_use]
     pub fn method_not_allowed() -> Self {
         Self::new(
@@ -92,6 +120,13 @@ impl Problem {
     #[must_use]
     pub fn service_unavailable(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, detail)
+    }
+}
+
+impl From<crate::db::DbError> for Problem {
+    fn from(error: crate::db::DbError) -> Self {
+        tracing::error!(%error, "database operation failed");
+        Self::internal()
     }
 }
 

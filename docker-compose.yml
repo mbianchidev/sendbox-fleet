@@ -34,6 +34,9 @@ services:
       FLEET_LOG_DIR: /var/log/sendbox-fleet
       FLEET_LOG_LEVEL: ${FLEET_LOG_LEVEL:-info}
       FLEET_LOG_RETENTION_DAYS: ${FLEET_LOG_RETENTION_DAYS:-30}
+      FLEET_AUTHORITY_ID: ${FLEET_AUTHORITY_ID:-sendbox-fleet}
+      # Container path of the profile signer file, mounted by a compose override.
+      FLEET_PROFILE_TRUST: ${FLEET_PROFILE_TRUST:-}
     ports:
       - "127.0.0.1:${FLEET_PORT:-8080}:8080"
     volumes:

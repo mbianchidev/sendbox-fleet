@@ -7,8 +7,10 @@
 //! `X-Forwarded-User` or a principal field inside a request body, are never
 //! treated as authenticated identity.
 //!
-//! No identity provider is wired up yet, so the production authenticator,
-//! [`UnconfiguredAuthenticator`], rejects every token.
+//! The production authenticator, [`DatabaseAuthenticator`], accepts opaque
+//! tokens issued with `sendbox-fleet admin token issue`. Only their SHA-256 is
+//! stored; a token is accepted while it is unexpired, unrevoked, and its
+//! principal is not disabled.
 
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
@@ -19,30 +21,30 @@ use actix_web::dev::{Payload, ServiceRequest, ServiceResponse};
 use actix_web::http::header;
 use actix_web::middleware::Next;
 use actix_web::{Error, FromRequest, HttpMessage, HttpRequest, ResponseError, web};
-use sendbox_governance::PrincipalId;
+use base64::Engine as _;
+pub use sendbox_governance::api::CallerKind;
+use sendbox_governance::{Clock, PrincipalId};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::db::{Arg, Database};
 use crate::problem::Problem;
+
+/// Prefix of tokens this service issues, so leaked tokens are recognizable.
+pub const TOKEN_PREFIX: &str = "sbf_";
 
 const MAX_TOKEN_BYTES: usize = 4096;
 const CHALLENGE: &str = r#"Bearer realm="sendbox-fleet""#;
 const CHALLENGE_INVALID_REQUEST: &str = r#"Bearer realm="sendbox-fleet", error="invalid_request""#;
 const CHALLENGE_INVALID_TOKEN: &str = r#"Bearer realm="sendbox-fleet", error="invalid_token""#;
 
-/// What kind of authenticated party is calling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallerKind {
-    /// A person using the management API.
-    User,
-    /// A SendBox host acting for sessions it runs.
-    Worker,
-}
-
 /// An authenticated caller. Only an [`Authenticator`] creates one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     pub principal: PrincipalId,
     pub kind: CallerKind,
+    /// Fleet-wide operator: publishes profiles and creates projects.
+    pub operator: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -51,6 +53,8 @@ pub enum AuthError {
     NotConfigured,
     #[error("bearer token was not accepted")]
     InvalidToken,
+    #[error("authentication is temporarily unavailable")]
+    Unavailable,
 }
 
 pub type AuthFuture<'a> = Pin<Box<dyn Future<Output = Result<Caller, AuthError>> + Send + 'a>>;
@@ -60,15 +64,79 @@ pub trait Authenticator: Send + Sync + 'static {
     fn authenticate<'a>(&'a self, bearer_token: &'a str) -> AuthFuture<'a>;
 }
 
-/// The authenticator used until an identity provider is integrated: it
-/// rejects every token.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct UnconfiguredAuthenticator;
+/// Accepts tokens recorded in `api_tokens`.
+pub struct DatabaseAuthenticator {
+    database: Database,
+    clock: Arc<dyn Clock>,
+}
 
-impl Authenticator for UnconfiguredAuthenticator {
-    fn authenticate<'a>(&'a self, _bearer_token: &'a str) -> AuthFuture<'a> {
-        Box::pin(async { Err(AuthError::NotConfigured) })
+impl DatabaseAuthenticator {
+    #[must_use]
+    pub fn new(database: Database, clock: Arc<dyn Clock>) -> Self {
+        Self { database, clock }
     }
+}
+
+impl Authenticator for DatabaseAuthenticator {
+    fn authenticate<'a>(&'a self, bearer_token: &'a str) -> AuthFuture<'a> {
+        Box::pin(async move {
+            if !bearer_token.starts_with(TOKEN_PREFIX) {
+                return Err(AuthError::InvalidToken);
+            }
+            let now = i64::try_from(self.clock.now_unix()).map_err(|_| AuthError::Unavailable)?;
+            let row = self
+                .database
+                .fetch_optional(
+                    "SELECT p.id AS principal, p.kind AS kind, p.is_operator AS operator \
+                     FROM api_tokens t JOIN principals p ON p.id = t.principal_id \
+                     WHERE t.token_sha256 = $1 AND t.revoked_at_unix IS NULL \
+                     AND t.expires_at_unix > $2 AND p.disabled_at_unix IS NULL",
+                    &[Arg::from(token_digest(bearer_token)), Arg::from(now)],
+                )
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "token lookup failed");
+                    AuthError::Unavailable
+                })?
+                .ok_or(AuthError::InvalidToken)?;
+            let caller = (|| {
+                let principal = PrincipalId::new(row.text("principal").ok()?).ok()?;
+                let kind = match row.text("kind").ok()?.as_str() {
+                    "user" => CallerKind::User,
+                    "worker" => CallerKind::Worker,
+                    _ => return None,
+                };
+                Some(Caller {
+                    principal,
+                    kind,
+                    operator: row.flag("operator").ok()?,
+                })
+            })();
+            caller.ok_or_else(|| {
+                tracing::error!("stored principal row is invalid");
+                AuthError::Unavailable
+            })
+        })
+    }
+}
+
+/// A new token and the SHA-256 digest that is stored in its place.
+#[must_use]
+pub fn token_from_bytes(bytes: &[u8; 32]) -> (String, String) {
+    let token = format!(
+        "{TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    );
+    let digest = token_digest(&token);
+    (token, digest)
+}
+
+#[must_use]
+pub fn token_digest(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Shared handle stored in application data.
@@ -143,7 +211,12 @@ fn valid_token(token: &str) -> bool {
 }
 
 fn rejection(error: AuthError) -> Problem {
-    Problem::unauthorized(error.to_string(), CHALLENGE_INVALID_TOKEN)
+    match error {
+        AuthError::Unavailable => Problem::service_unavailable(error.to_string()),
+        AuthError::NotConfigured | AuthError::InvalidToken => {
+            Problem::unauthorized(error.to_string(), CHALLENGE_INVALID_TOKEN)
+        }
+    }
 }
 
 /// Extracts the caller authenticated by [`require_bearer`]. Rejects the
@@ -173,6 +246,17 @@ mod tests {
     use actix_web::test::TestRequest;
 
     use super::*;
+
+    #[test]
+    fn issued_tokens_are_bearer_tokens_stored_only_as_digests() {
+        let (token, digest) = token_from_bytes(&[7; 32]);
+        assert!(token.starts_with(TOKEN_PREFIX));
+        assert!(valid_token(&token));
+        assert_eq!(digest.len(), 64);
+        assert!(!digest.contains(&token[TOKEN_PREFIX.len()..]));
+        assert_eq!(token_digest(&token), digest);
+        assert_ne!(token_from_bytes(&[8; 32]).1, digest);
+    }
 
     #[test]
     fn bearer_token_grammar_is_enforced() {

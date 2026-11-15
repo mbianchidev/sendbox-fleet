@@ -27,7 +27,9 @@ sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", branch = 
   depends on `sendbox-core` by path; Cargo resolves both from the same git
   checkout.
 - Only `main` is tracked, so the recorded commit cannot disappear when sendbox
-  feature branches are rewritten or deleted.
+  feature branches are rewritten or deleted. A pull request that needs an
+  unmerged contract change may track the sendbox pull request branch while
+  both are in review; it must move back to `main` before it merges.
 
 To move the lockfile by hand, to the latest `main` commit or to a specific one:
 
@@ -41,30 +43,35 @@ cargo test --locked --workspace
 
 | Contract type | Used by |
 | --- | --- |
-| `GovernanceBinding`, `AuthorityRef`, `SessionRef` | `POST /v1/sessions:admit` body |
+| `api::CallerIdentity` | `GET /v1/whoami` response |
+| `api::SessionAdmissionRequest`, `api::SessionAdmission`, `GovernanceBinding` | `POST /v1/sessions:admit` body and response |
+| `api::SessionEnd` | `POST /v1/sessions/{session}:end` body |
 | `GrantRequest`, `CredentialGrant` | `POST /v1/grants` body and response |
 | `GrantId` | `:renew` and `:revoke` path parameter; renew response is a `CredentialGrant` |
-| `RevocationReason` | `:revoke` body |
-| `RequestContext`, `Decision`, `DenyReason` | `POST /v1/authorize` body and response |
-| `ProfileId`, `ProfileRef`, `GovernanceProfile` | `/v1/profiles/{profile_id}`; publication bodies are parsed with `GovernanceProfile::parse` |
+| `api::RevokeGrantRequest`, `RevocationReason` | `:revoke` body |
+| `RequestContext`, `Decision`, `DenyReason`, `evaluate_request` | `POST /v1/authorize` body, response, and decision rules |
+| `ProfileId`, `ProfileRef`, `GovernanceProfile`, `check_current` | `/v1/profiles/{profile_id}`; publication bodies are parsed with `GovernanceProfile::parse` |
+| `PolicyException`, `ExceptionScope`, `ExceptionId`, `api::ExceptionList` | `/v1/exceptions` responses; scopes are checked with `GovernanceProfile::permits_exception` |
 | `ProjectId`, `PrincipalId` | Role, exception, and audit endpoints |
-| `Sha256Digest` | Digests in responses and audit events |
+| `Sha256Digest`, `canonical_digest` | Digests in responses, binding storage, and audit event hashes |
 
 Validation is the contract's own: identifier grammars, `deny_unknown_fields`,
 `GovernanceBinding::validate`, `validate_method`, `validate_path_prefix`, and
 `GovernanceProfile::parse`. Invalid input is a `400` problem.
 
-Types that only exist on the management API live in this repository, in the
-route module that uses them: `SessionAdmissionRequest`, `RevokeGrantRequest`,
-`ProfilePublication` and `ProfileSignature`, `ProjectRole` and `RoleBinding`,
-`ExceptionRequest`, and the audit query and event types. The profile signature
-envelope is a placeholder: once increment 1 defines the operator signing
-format in `sendbox-governance`, the fleet adopts that type instead.
+Wire types a SendBox host also uses live in `sendbox_governance::api`. Types
+only people use live here, in the route module that uses them:
+`CreateProject`, `ProjectRole` and `RoleBinding`, `ExceptionRequest`,
+`ProfilePublication` and `MinimumRevision`, and the audit query, page, and
+event types. Profile signatures use SendBox's signing envelope
+(`sendbox_security::provenance::DetachedSignature` in a
+`sendbox.governance-signatures` bundle), verified with the same trust store
+code as hosts.
 
 ## Versioning
 
-- `sendbox_governance::CONTRACT_VERSION` (currently `1`) is the wire and digest
-  version. `GovernanceBinding` and `CredentialGrant` carry it, and validation
+- `sendbox_governance::CONTRACT_VERSION` (currently `2`, which added
+  exceptions to the session binding) is the wire and digest version. `GovernanceBinding` and `CredentialGrant` carry it, and validation
   rejects any other value. The server logs it at startup.
 - Contract structs use `deny_unknown_fields`, so adding a field is a breaking
   change for older peers. Any change to a contract type or to how digests are

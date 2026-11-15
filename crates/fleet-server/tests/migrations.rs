@@ -8,7 +8,9 @@
 use fleet_server::config::{DatabaseKind, DatabaseUrl};
 use fleet_server::db::Database;
 
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 12] = [
+    "api_tokens",
+    "session_exceptions",
     "principals",
     "projects",
     "role_bindings",
@@ -244,21 +246,77 @@ async fn identities_are_bound_and_lifetimes_bounded() {
     reject(&database, &revocation(61)).await;
     accept(&database, &revocation(5)).await;
 
-    let exception = |decided_by: &str, expires: i64| {
+    let exception = |kind: &str, value: &str, decided_by: &str, expires: i64| {
         format!(
             "INSERT INTO exceptions (id, project_id, profile_id, profile_revision, profile_sha256, \
              scope_kind, scope_value, reason, status, requested_by, requested_at_unix, decided_by, \
              decided_at_unix, expires_at_unix) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
-             'github:example/service', 'example-default', 3, '{PROFILE_SHA}', 'network_domain', \
-             'registry.example.com', 'Package mirror outage', 'approved', 'oidc:alice@example.com', \
+             'github:example/service', 'example-default', 3, '{PROFILE_SHA}', '{kind}', \
+             '{value}', 'Package mirror outage', 'approved', 'oidc:alice@example.com', \
              1790000000, '{decided_by}', 1790000100, {expires})"
         )
     };
-    reject(&database, &exception("oidc:alice@example.com", 1790086400)).await;
+    let domain = |decided_by: &str, expires: i64| {
+        exception("domain", "registry.example.com", decided_by, expires)
+    };
+    reject(&database, &domain("oidc:alice@example.com", 1790086400)).await;
     reject(
         &database,
-        &exception("oidc:bob@example.com", 1790000000 + 604801),
+        &domain("oidc:bob@example.com", 1790000000 + 604801),
     )
     .await;
-    accept(&database, &exception("oidc:bob@example.com", 1790086400)).await;
+    for (kind, value) in [
+        ("network_domain", "registry.example.com"),
+        ("command", " git push"),
+        ("domain", "tab\there"),
+    ] {
+        reject(
+            &database,
+            &exception(kind, value, "oidc:bob@example.com", 1790086400),
+        )
+        .await;
+    }
+    accept(
+        &database,
+        &exception(
+            "command",
+            "git push --force *",
+            "oidc:bob@example.com",
+            1790086400,
+        ),
+    )
+    .await;
+
+    let session_exception = |exception: &str| {
+        format!(
+            "INSERT INTO session_exceptions (session_id, exception_id) VALUES ('{SESSION}', '{exception}')"
+        )
+    };
+    reject(&database, &session_exception(&"b".repeat(32))).await;
+    accept(&database, &session_exception(&"a".repeat(32))).await;
+}
+
+#[actix_web::test]
+async fn tokens_are_digests_with_bounded_lifetimes() {
+    let database = database().await;
+    seed(&database).await;
+    let token = |id: char, digest: char, expires: i64| {
+        format!(
+            "INSERT INTO api_tokens (id, principal_id, token_sha256, created_at_unix, \
+             expires_at_unix) VALUES ('{}', 'oidc:alice@example.com', '{}', 1790000000, {expires})",
+            id.to_string().repeat(32),
+            digest.to_string().repeat(64)
+        )
+    };
+    reject(&database, &token('a', 'a', 1790000000 + 7776001)).await;
+    reject(&database, &token('a', 'A', 1790086400)).await;
+    accept(&database, &token('a', 'a', 1790086400)).await;
+    reject(&database, &token('b', 'a', 1790086400)).await;
+    reject(
+        &database,
+        "INSERT INTO api_tokens (id, principal_id, token_sha256, created_at_unix, expires_at_unix) \
+         VALUES ('cccccccccccccccccccccccccccccccc', 'oidc:nobody@example.com', \
+         'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 0, 10)",
+    )
+    .await;
 }

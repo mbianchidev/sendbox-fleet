@@ -18,6 +18,8 @@ with status `2` and a message naming the variable when a value is invalid.
 | `FLEET_LOG_DIR` | `./logs` | Log directory; relative paths resolve against the working directory at startup |
 | `FLEET_LOG_LEVEL` | `info,sqlx=warn` | [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directives |
 | `FLEET_LOG_RETENTION_DAYS` | `30` | Days to keep rotated log files (1 to 3650) |
+| `FLEET_AUTHORITY_ID` | `sendbox-fleet` | Authority id hosts put in `authority:` of their operator configuration and bind into every session; not `local` |
+| `FLEET_PROFILE_TRUST` | unset | YAML or JSON file with `threshold` and `signers` (the same shape as a host operator configuration's `trust` section). Profile publication is refused until it is set |
 
 Database credentials in `FLEET_DATABASE_URL` are never logged.
 
@@ -35,6 +37,46 @@ curl -i -X POST http://127.0.0.1:8080/v1/authorize   # 401: authentication requi
 Migrations run at startup. Stop the server with Ctrl-C (or `SIGTERM`); it
 stops accepting connections, gives in-flight requests up to 30 seconds,
 closes the database pool, and flushes logs.
+
+## Bootstrap principals, tokens, and projects
+
+`sendbox-fleet admin` acts on the database directly and needs only
+`FLEET_DATABASE_URL`. Every change is audited with the actor `cli:admin`.
+
+```sh
+sendbox-fleet admin principal add oidc:olivia@example.com --kind user --operator
+sendbox-fleet admin principal add oidc:owen@example.com --kind user
+sendbox-fleet admin principal add worker:ci-1 --kind worker
+sendbox-fleet admin project create github:example/service --owner oidc:owen@example.com
+sendbox-fleet admin token issue oidc:owen@example.com --ttl-days 30 > owen.token
+sendbox-fleet admin token list oidc:owen@example.com
+sendbox-fleet admin token revoke <token-id>
+sendbox-fleet admin principal disable oidc:owen@example.com
+```
+
+`token issue` prints the token once on stdout; only its SHA-256 is stored.
+People then use the API with `Authorization: Bearer <token>`, for example:
+
+```sh
+T=$(cat owen.token); U=http://127.0.0.1:8080
+curl -H "Authorization: Bearer $T" $U/v1/whoami
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  -d '{"principal":"oidc:alice@example.com","role":"member"}' \
+  "$U/v1/projects/github:example%2Fservice/roles"
+```
+
+An operator publishes the exact profile and the signature bundle produced by
+`sendbox governance sign`:
+
+```sh
+jq -n --rawfile document acme.yaml --slurpfile signatures acme.yaml.sig.json \
+  '{document: $document, signatures: $signatures[0]}' |
+  curl -X PUT -H "Authorization: Bearer $OPERATOR_TOKEN" \
+    -H 'Content-Type: application/json' --data @- $U/v1/profiles/acme
+```
+
+On each SendBox host, the operator configuration names this service and the
+caller stores their own token: `sendbox secrets add SENDBOX_FLEET_TOKEN`.
 
 ## Run with PostgreSQL (Compose)
 
@@ -57,21 +99,22 @@ cargo test --locked --workspace
 cargo audit --deny warnings          # needs cargo-audit; see .cargo/audit.toml
 ```
 
-Tests use in-memory SQLite and synthetic data. To run the migration tests
-against PostgreSQL, point `FLEET_TEST_DATABASE_URL` at a disposable database
-whose name ends in `_test` (the tests drop and recreate its `public` schema):
+Tests use in-memory SQLite and synthetic data. To run the migration and API
+tests against PostgreSQL, point `FLEET_TEST_DATABASE_URL` at a disposable
+database whose name ends in `_test` (the tests drop and recreate its `public`
+schema):
 
 ```sh
 docker run -d --name sendbox-fleet-pg-test -p 127.0.0.1:55432:5432 \
   -e POSTGRES_DB=sendbox_fleet_test -e POSTGRES_USER=sendbox_fleet \
   -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18.7-alpine3.24
 FLEET_TEST_DATABASE_URL=postgres://sendbox_fleet@127.0.0.1:55432/sendbox_fleet_test \
-  cargo test --locked --workspace --test migrations -- --test-threads=1
+  cargo test --locked --workspace --test migrations --test http -- --test-threads=1
 docker rm -f sendbox-fleet-pg-test
 ```
 
-CI runs formatting, Clippy, and tests on SQLite; the migration tests plus a
-start, probe, and graceful-stop run of the server on PostgreSQL; and
+CI runs formatting, Clippy, and tests on SQLite; the migration and API tests
+plus a start, probe, and graceful-stop run of the server on PostgreSQL; and
 `cargo audit`.
 
 ## Logs
@@ -107,4 +150,6 @@ invariant.
 | `cannot connect to postgres://***@...` | Database not reachable or wrong credentials |
 | `cannot listen on ...` | Port already in use; set `FLEET_BIND` or `FLEET_PORT` |
 | `cannot create log directory` | `FLEET_LOG_DIR` not writable by the server user |
-| Every `/v1` call returns `401 authentication provider not configured` | Expected: no identity provider is integrated yet |
+| Every `/v1` call returns `401 bearer token was not accepted` | The token is unknown, expired, revoked, or its principal is disabled; issue a new one with `sendbox-fleet admin token issue` |
+| `503 profile signers are not configured` on profile publication | Set `FLEET_PROFILE_TRUST` |
+| `409 ... is not the current revision` on session admission | The host's local profile differs from the newest published revision; install the same signed bytes on the host |
