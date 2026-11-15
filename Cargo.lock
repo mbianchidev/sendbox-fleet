@@ -1447,7 +1447,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 [[package]]
 name = "sendbox-core"
 version = "0.2.7"
-source = "git+https://github.com/mbianchidev/sendbox?rev=bd7498ab24c3c9cfd98f80349bee31fed667539b#bd7498ab24c3c9cfd98f80349bee31fed667539b"
+source = "git+https://github.com/mbianchidev/sendbox?rev=98172513625384ad2f79c238aaefb7d6e0dde752#98172513625384ad2f79c238aaefb7d6e0dde752"
 dependencies = [
  "serde",
 ]
@@ -1455,7 +1455,7 @@ dependencies = [
 [[package]]
 name = "sendbox-governance"
 version = "0.2.7"
-source = "git+https://github.com/mbianchidev/sendbox?rev=bd7498ab24c3c9cfd98f80349bee31fed667539b#bd7498ab24c3c9cfd98f80349bee31fed667539b"
+source = "git+https://github.com/mbianchidev/sendbox?rev=98172513625384ad2f79c238aaefb7d6e0dde752#98172513625384ad2f79c238aaefb7d6e0dde752"
 dependencies = [
  "sendbox-core",
  "serde",

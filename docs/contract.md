@@ -11,7 +11,7 @@ redefining any of those types.
 
 ```toml
 # Cargo.toml (workspace)
-sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", rev = "bd7498ab24c3c9cfd98f80349bee31fed667539b" }
+sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", rev = "98172513625384ad2f79c238aaefb7d6e0dde752" }
 ```
 
 - The dependency is pinned to an exact commit, and `Cargo.lock` records it, so
@@ -20,10 +20,10 @@ sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", rev = "bd
 - `sendbox-governance` inherits versions from the sendbox workspace and
   depends on `sendbox-core` by path; Cargo resolves both from the same git
   checkout.
-- The pinned commit is on the increment-1 branch
-  `cp-desktop-governed-sessions-policy-profiles`. Once that work merges, move
-  the pin to the merged commit on `main` (or a tag) so the revision cannot
-  disappear if the branch is rewritten or deleted.
+- The pinned commit is the merge of increment 1
+  ([mbianchidev/sendbox#93](https://github.com/mbianchidev/sendbox/pull/93))
+  on sendbox `main`, so the revision cannot disappear when feature branches
+  are rewritten or deleted. Only pin to commits on `main` or to release tags.
 
 To update the pin:
 
