@@ -16,8 +16,8 @@ actix-web = { version = "4.19.0", default-features = false, features = ["macros"
 base64 = "0.22.1"
 clap = { version = "4.6.2", features = ["derive"] }
 getrandom = "0.4.3"
-sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", branch = "cp-desktop-fleet-project-roles-exceptions" }
-sendbox-security = { git = "https://github.com/mbianchidev/sendbox", branch = "cp-desktop-fleet-project-roles-exceptions" }
+sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", branch = "main" }
+sendbox-security = { git = "https://github.com/mbianchidev/sendbox", branch = "main" }
 serde_json_canonicalizer = "0.3.2"
 serde_yaml_ng = { package = "yaml_serde", version = "0.10.7" }
 sha2 = "0.11.0"

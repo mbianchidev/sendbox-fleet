@@ -649,7 +649,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1552,7 +1552,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1622,7 +1622,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 [[package]]
 name = "sendbox-core"
 version = "0.2.7"
-source = "git+https://github.com/mbianchidev/sendbox?branch=cp-desktop-fleet-project-roles-exceptions#e8114683f81c96f727bb0914362ac1668f222213"
+source = "git+https://github.com/mbianchidev/sendbox?branch=main#a04b2373f5dcc20829d028f9664d6744806b5f7e"
 dependencies = [
  "serde",
 ]
@@ -1630,7 +1630,7 @@ dependencies = [
 [[package]]
 name = "sendbox-governance"
 version = "0.2.7"
-source = "git+https://github.com/mbianchidev/sendbox?branch=cp-desktop-fleet-project-roles-exceptions#e8114683f81c96f727bb0914362ac1668f222213"
+source = "git+https://github.com/mbianchidev/sendbox?branch=main#a04b2373f5dcc20829d028f9664d6744806b5f7e"
 dependencies = [
  "sendbox-core",
  "serde",
@@ -1644,7 +1644,7 @@ dependencies = [
 [[package]]
 name = "sendbox-security"
 version = "0.2.7"
-source = "git+https://github.com/mbianchidev/sendbox?branch=cp-desktop-fleet-project-roles-exceptions#e8114683f81c96f727bb0914362ac1668f222213"
+source = "git+https://github.com/mbianchidev/sendbox?branch=main#a04b2373f5dcc20829d028f9664d6744806b5f7e"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -2108,7 +2108,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
