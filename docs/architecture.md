@@ -5,10 +5,10 @@
 It is increment 2 of that issue: the authenticated, multi-user management API
 and central authority that increment 1 deliberately left out.
 
-**Status: scaffold.** The service runs, authenticates every `/v1` request,
-validates request bodies against the shared contract, and answers every
-management operation with `501 Not Implemented`. No governance decision is
-made yet. See [roadmap.md](roadmap.md).
+It authenticates every `/v1` caller, enforces project-scoped roles, verifies
+and publishes operator-signed profiles, admits governed sessions, issues and
+checks credential grants, records bounded and expiring exceptions, and keeps a
+hash-chained central audit log. See [roadmap.md](roadmap.md) for what remains.
 
 ## Relationship to SendBox increment 1
 
@@ -24,8 +24,12 @@ repository and works on a single host:
 
 Increment 2 moves the *authority* off the host, so several hosts and users
 share one set of profiles, roles, grants, exceptions, and audit evidence. The
-fleet implements the same `GrantAuthority` semantics over HTTP; a SendBox host
-uses a remote authority client instead of the local one.
+fleet implements the same `GrantAuthority` semantics over HTTP (both use
+`sendbox_governance::evaluate_request`); a SendBox host whose operator
+configuration has a `fleet` section uses its remote authority client instead
+of the local one. See SendBox's
+[shared governance service](https://github.com/mbianchidev/sendbox/blob/main/docs/architecture/governed-sessions.md#shared-governance-service)
+for the host side.
 
 ```mermaid
 flowchart LR
@@ -71,33 +75,54 @@ flowchart LR
   request is rejected with `401` before its body is read. Only
   `Authorization: Bearer <token>` is accepted. Identity headers such as
   `X-Forwarded-User`, `X-Remote-User`, or `X-Sendbox-Principal` are ignored.
-  The `Authenticator` trait maps a token to a `Caller` (principal and kind).
-  No identity provider is integrated yet: the production
-  `UnconfiguredAuthenticator` rejects every token with
-  `authentication provider not configured`.
-- **Authorization** answers "may this caller do this". It will combine the
-  caller kind (user or worker), project roles (`owner`, `admin`, `member`,
-  `viewer`), the current profile ceiling, admitted sessions, grants, and
-  approved exceptions.
-- **Workload identity fields are never authoritative.** Principal and project
-  fields inside request bodies (for example `GovernanceBinding.principal`) are
-  claims to check against the authenticated caller and stored state, never a
-  source of identity. `local-user:` principals belong to single-host
-  increment 1 and are rejected by both the API and the schema.
+  `DatabaseAuthenticator` accepts opaque `sbf_` tokens issued with
+  `sendbox-fleet admin token issue`: only their SHA-256 is stored, and a token
+  works while it is unexpired (at most 90 days), unrevoked, and its principal
+  is not disabled. A failed token lookup is `503`, never an implicit allow.
+- **Authorization** answers "may this caller do this". It combines the caller
+  kind (`user` or `worker`), the fleet-wide `operator` flag, project roles,
+  the current profile revision, admitted sessions, grants, and exceptions,
+  all read from the database.
+- **Workload identity fields are never authoritative.** A binding or grant
+  principal must equal the authenticated caller; a host cannot claim another
+  identity. `local-user:` principals belong to single-host increment 1 and are
+  rejected by both the API and the schema.
 
-## Planned request flow
+## Roles
 
-| Step | Endpoint | Contract types | Planned checks |
-| --- | --- | --- | --- |
-| Admit a session | `POST /v1/sessions:admit` | `SessionRef`, `GovernanceBinding` | Caller is a worker; principal holds `member` or higher in the project; profile revision is current (at or above the minimum, inside its validity window, digest matches); binding digest recorded |
-| Issue a grant | `POST /v1/grants` | `GrantRequest` to `CredentialGrant` | Session admitted by this worker; binding digest matches; service admitted by the binding; methods and paths inside the profile; bounded lease and TTL |
-| Authorize a request | `POST /v1/authorize` | `RequestContext` to `Decision` | Same checks as `LocalGrantAuthority::authorize`, against shared state. Hosts treat any non-200 answer as `authority_unavailable` and deny |
-| Renew a lease | `POST /v1/grants/{grant_id}:renew` | `GrantId` to `CredentialGrant` | Not revoked, not expired, profile still current; lease never exceeds the grant's hard expiry |
-| Revoke a grant | `POST /v1/grants/{grant_id}:revoke` | `RevocationReason` | New requests denied immediately; open streams may finish within the grace window (at most 60 seconds); completed external effects are not reversed and are audited with outcome `unknown` when unconfirmed |
-| Read or publish a profile | `GET` / `PUT /v1/profiles/{profile_id}` | `ProfileId`, `GovernanceProfile`, `ProfileRef` | Publication by an operator; signature verification over the exact bytes |
-| List or assign roles | `GET` / `POST /v1/projects/{project_id}/roles` | `ProjectId`, `PrincipalId` | Only `owner` assigns roles |
-| Request an exception | `POST /v1/exceptions` | `ProjectId`, `PrincipalId`, `ProfileRef` | Bounded scope, reason, expiry at most 7 days; approval by a different authorized principal; never wider than the profile ceiling; bound to the exact revision |
-| Query audit events | `GET /v1/audit/events` | `ProjectId`, `SessionRef`, `PrincipalId`, `DenyReason` | Role-scoped visibility; cursor pagination |
+| Who | May |
+| --- | --- |
+| Operator (fleet-wide, users only) | Publish profiles, raise minimum revisions, create projects with a first owner, manage any project's roles, revoke grants and exceptions, read and verify all audit |
+| `owner` | Assign and remove roles (never leaving the project without an owner), approve or reject exceptions, run sessions |
+| `admin` | Approve or reject exceptions, revoke grants (`operator_revoked`, `policy_changed`), run sessions |
+| `member` | Run governed sessions, request exceptions |
+| `viewer` | Read roles, exceptions, and the project's audit events |
+
+Workers never manage roles, profiles, or exceptions. A principal runs
+sessions as itself: it needs `member` or higher in the project.
+
+## Request flow
+
+| Step | Endpoint | Checks |
+| --- | --- | --- |
+| Identify | `GET /v1/whoami` | Returns the authenticated principal, kind, and operator flag |
+| Admit a session | `POST /v1/sessions:admit` | Binding principal is the caller; binding names this authority (`FLEET_AUTHORITY_ID`); caller holds `member` or higher; profile reference is the current revision (at or above the minimum, unexpired, digest matches); brokered services exist in the profile; every bound exception is approved, unrevoked, unexpired, for this project and principal (or project-wide), bound to this exact revision, and permitted by it. Records the canonical binding |
+| End a session | `POST /v1/sessions/{session}:end` | Session principal only; revokes every live grant with the matching session reason |
+| Issue a grant | `POST /v1/grants` | Caller and request match the admitted session's binding exactly; session not ended; service admitted; methods and path prefixes inside the profile service; profile current; bound exceptions still valid. Lease from the profile; hard expiry capped by the profile TTL, profile expiry, the earliest bound exception expiry, and 7 days |
+| Authorize a request | `POST /v1/authorize` | `evaluate_request` against shared state, plus: the caller is the grant principal, the session is not ended, bound exceptions are still valid. Every decision is audited with a redacted target |
+| Renew a lease | `POST /v1/grants/{grant}:renew` | Grant principal; not revoked or expired; lease not lapsed; session admitted; profile current; exceptions valid. Lease never exceeds the hard expiry or the earliest exception expiry |
+| Revoke a grant | `POST /v1/grants/{grant}:revoke` | Session reasons by the grant principal; `operator_revoked` and `policy_changed` by an `admin`, `owner`, or operator. New requests deny at once; the grace window is the profile's `revocation_grace_seconds` (at most 60) |
+| Publish a profile | `PUT /v1/profiles/{profile}` | Operator; body is the exact YAML plus the `sendbox.governance-signatures` bundle that `sendbox governance sign` writes; signatures must satisfy `FLEET_PROFILE_TRUST`; revisions only increase |
+| Read a profile | `GET /v1/profiles/{profile}[?revision=N]` | Any caller; the current revision is the newest whose `not_before_unix` has passed |
+| Raise the minimum | `PUT /v1/profiles/{profile}/minimum-revision` | Operator; minimums only rise; older revisions, and everything bound to them, become stale |
+| Create a project | `POST /v1/projects` | Operator; the owner must be an active principal |
+| List or change roles | `GET` / `POST /v1/projects/{project}/roles`, `DELETE …/roles/{principal}` | Listing needs any role (or operator); changes need `owner` (or operator); the last owner cannot be removed or demoted |
+| Request an exception | `POST /v1/exceptions` | User with `member` or higher; scope is a denial the current revision lists under `exceptions`; optional principal must be a member; expiry in the future, within the profile's `exceptions.max_ttl_seconds` (at most 7 days) and before the profile expires |
+| Decide an exception | `POST /v1/exceptions/{id}:approve` / `:reject` | User with `owner` or `admin`, not the requester; approval only while unexpired and its revision is still current |
+| Revoke an exception | `POST /v1/exceptions/{id}:revoke` | Requester, `owner`, `admin`, or operator. Sessions admitted with it are denied on their next request or renewal |
+| List exceptions | `GET /v1/exceptions?project=…&state=active\|pending\|all`, `GET /v1/exceptions/{id}` | Any role in the project (or operator) |
+| Query audit events | `GET /v1/audit/events` | Operators read everything; others must pass a `project` in which they hold a role. Cursor pagination |
+| Verify the chain | `GET /v1/audit/verify` | Operator; recomputes every hash and link |
 
 Project identifiers contain a slash (`github:owner/repo`), so clients
 percent-encode it in paths: `/v1/projects/github:owner%2Frepo/roles`.
@@ -105,17 +130,21 @@ percent-encode it in paths: `/v1/projects/github:owner%2Frepo/roles`.
 ## HTTP responses
 
 Errors use RFC 9457 `application/problem+json` with `type: about:blank`, the
-standard reason phrase as `title`, and a specific `detail`. `501` responses add
-a `capability` member naming the unimplemented increment-2 capability.
+standard reason phrase as `title`, and a specific `detail`.
 
 | Status | When |
 | --- | --- |
 | `400` | Body, path, or query does not match the contract |
 | `401` | Missing, malformed, or unaccepted bearer token (with `WWW-Authenticate: Bearer`) |
-| `404` / `405` | Unknown path or unsupported method |
+| `403` | Authenticated, but the role, kind, operator flag, profile, or signer check refuses it |
+| `404` / `405` | Unknown resource or path, or unsupported method |
+| `409` | Stale profile revision, stale or inactive exception, already-decided exception, ended session, duplicate admission, last owner |
 | `413` / `415` | Body too large (64 KiB, 1 MiB for profile publication) or not JSON |
-| `501` | Valid, authenticated request for an increment-2 capability |
-| `503` | `/readyz` cannot reach the database |
+| `500` | Internal failure; the cause is logged, never returned |
+| `503` | Authentication or `/readyz` cannot reach the database, or profile publication without `FLEET_PROFILE_TRUST` |
+
+A per-request authorization denial is a `200` with `{"decision": "deny",
+"reason": …}`; hosts deny on any other answer.
 
 `GET /healthz` (liveness) and `GET /readyz` (database round trip) are
 unauthenticated and reveal nothing beyond availability.
@@ -128,7 +157,8 @@ deployment target; SQLite is for local development and tests.
 
 | Table | Holds |
 | --- | --- |
-| `principals` | Authenticated users and workers (never `local-user:`) |
+| `principals` | Authenticated users and workers (never `local-user:`), with the operator flag |
+| `api_tokens` | SHA-256 of each bearer token, expiry (at most 90 days), revocation |
 | `projects` | `github:owner/repo` or `path-sha256:` projects |
 | `role_bindings` | One project-scoped role per principal per project |
 | `profiles` | Exact signed bytes, digest, signatures, validity window per revision |
@@ -136,16 +166,36 @@ deployment target; SQLite is for local development and tests.
 | `sessions` | Admitted sessions with their canonical binding and digest |
 | `credential_grants` | Grant scope, lease, hard expiry, generation; no credential material |
 | `revocations` | Reason, actor, bounded grace window |
-| `exceptions` | Scope, reason, requester, approver, expiry, exact profile revision |
-| `audit_events` | Append-only, hash-chained evidence with a redacted target |
+| `exceptions` | One liftable denial (`command`, `domain`, `network`), reason, requester, approver, expiry, revocation, exact profile revision |
+| `session_exceptions` | Exceptions each session was admitted with |
+| `audit_events` | Append-only, hash-chained evidence with a redacted target, the exception concerned, and a short non-secret detail |
 
 Constraints carry the invariants the database can check: identifier grammar,
-7-day grant and exception lifetimes, a 60-second revocation grace, approvers
-who differ from requesters, grants whose principal, project, binding, and
-profile must equal their session's (composite foreign key), and audit rows that
-must extend the chain and can never be updated or deleted (triggers). Each
-`event_hash` will be SHA-256 over `previous_hash` and the event's RFC 8785
-canonical JSON, computed by the service.
+7-day grant and exception lifetimes, 90-day tokens, a 60-second revocation
+grace, approvers who differ from requesters, grants whose principal, project,
+binding, and profile must equal their session's (composite foreign key), and
+audit rows that must extend the chain and can never be updated or deleted
+(triggers).
+
+Writers are serialized (SQLite `BEGIN IMMEDIATE`, PostgreSQL transaction
+advisory lock), so check-then-write decisions cannot race. Every state change
+and the audit event that records it commit in one transaction; a refused,
+security-relevant request commits only its audit event.
+
+## Audit
+
+Each event records the actor (the authenticated caller, or `cli:admin`), the
+principal, project, session, grant, exception, and profile revision it
+concerns, the decision and deny reason, an outcome, a redacted target
+(`METHOD service/path`, never a query string), and a short detail such as
+`role=admin` or `scope=domain:gist.github.com`. Credentials, tokens, headers,
+request or response bodies, and exception reasons are never recorded.
+
+`event_hash` is the SHA-256 of the RFC 8785 canonical JSON of the event as
+returned by `GET /v1/audit/events` without `event_hash` (so it includes
+`previous_hash`). The first event links to 64 zeros. `GET /v1/audit/verify`
+recomputes the chain; anchoring chain heads outside the database is on the
+roadmap.
 
 ## Logging
 
@@ -158,14 +208,18 @@ bodies, headers, and query strings are never logged. Details in
 
 ```text
 crates/fleet-server/src/
-  main.rs          process entry: config, logging, runtime, exit codes
+  main.rs          process entry: serve (default) or `admin` subcommands
+  admin.rs         bootstrap: principals, tokens, projects (direct database access)
   server.rs        app assembly, startup, graceful shutdown, retention timer
-  config.rs        environment configuration and validation
+  config.rs        environment configuration and profile trust loading
+  state.rs         shared state: database, clock, random ids, authority id, trust
   logging.rs       subscriber setup and request logging middleware
   logging/retention.rs
-  db.rs            pools, migrations, readiness ping
+  db.rs            pools, migrations, readiness, backend-neutral transactions and rows
+  governance.rs    stored roles, profiles, sessions, grants, and exceptions
+  audit.rs         hash-chained append, queries, chain verification
   problem.rs       RFC 9457 problem responses
-  auth.rs          bearer authentication middleware and Authenticator trait
-  routes/          health probes and the /v1 scaffold
+  auth.rs          bearer authentication middleware and DatabaseAuthenticator
+  routes/          health probes and the /v1 API
 migrations/{postgres,sqlite}/
 ```

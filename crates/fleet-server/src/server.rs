@@ -14,12 +14,13 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 
-use crate::auth::{self, SharedAuthenticator, UnconfiguredAuthenticator};
-use crate::config::Config;
+use crate::auth::{self, DatabaseAuthenticator, SharedAuthenticator};
+use crate::config::{Config, ConfigError, ProfileTrust};
 use crate::db::{Database, DbError};
 use crate::logging::{self, retention};
 use crate::problem;
 use crate::routes;
+use crate::state::{AppState, os_random};
 
 /// Time in-flight requests get to finish after SIGINT or SIGTERM.
 const SHUTDOWN_GRACE_SECONDS: u64 = 30;
@@ -27,6 +28,8 @@ const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     #[error(transparent)]
     Database(#[from] DbError),
     #[error("cannot listen on {address}: {source}")]
@@ -40,7 +43,7 @@ pub enum ServerError {
 
 /// Builds the application. Shared by the server and the HTTP tests.
 pub fn app(
-    database: web::Data<Database>,
+    state: web::Data<AppState>,
     authenticator: SharedAuthenticator,
 ) -> App<
     impl ServiceFactory<
@@ -52,7 +55,8 @@ pub fn app(
     >,
 > {
     App::new()
-        .app_data(database)
+        .app_data(web::Data::new(state.database.clone()))
+        .app_data(state)
         .app_data(authenticator)
         .wrap(from_fn(logging::request_log))
         .configure(routes::configure)
@@ -61,6 +65,11 @@ pub fn app(
 
 /// Connects and migrates the database, then serves until SIGINT or SIGTERM.
 pub async fn run(config: Config, log_dir: PathBuf) -> Result<(), ServerError> {
+    let profile_trust = config
+        .profile_trust
+        .as_deref()
+        .map(ProfileTrust::load)
+        .transpose()?;
     let retention = spawn_retention(log_dir.clone(), config.logging.retention_days);
     let database = Database::connect(&config.database_url).await?;
     database.migrate().await?;
@@ -68,16 +77,29 @@ pub async fn run(config: Config, log_dir: PathBuf) -> Result<(), ServerError> {
         bind = %config.bind,
         database = %config.database_url,
         log_dir = %log_dir.display(),
+        authority_id = %config.authority_id,
         contract_version = crate::CONTRACT_VERSION,
         "sendbox-fleet starting"
     );
-    tracing::warn!(
-        "no authentication provider is configured; every /v1 request is rejected with 401"
-    );
+    if profile_trust.is_none() {
+        tracing::warn!(
+            "FLEET_PROFILE_TRUST is not set; profile publication is refused until it is configured"
+        );
+    }
 
-    let data = web::Data::new(database.clone());
-    let authenticator = auth::shared(Arc::new(UnconfiguredAuthenticator));
-    let server = HttpServer::new(move || app(data.clone(), authenticator.clone()))
+    let clock: Arc<dyn sendbox_governance::Clock> = Arc::new(sendbox_governance::SystemClock);
+    let state = web::Data::new(AppState {
+        database: database.clone(),
+        clock: Arc::clone(&clock),
+        random: Arc::new(os_random),
+        authority_id: config.authority_id.clone(),
+        profile_trust,
+    });
+    let authenticator = auth::shared(Arc::new(DatabaseAuthenticator::new(
+        database.clone(),
+        clock,
+    )));
+    let server = HttpServer::new(move || app(state.clone(), authenticator.clone()))
         .shutdown_timeout(SHUTDOWN_GRACE_SECONDS)
         .bind(config.bind)
         .map_err(|source| ServerError::Bind {
