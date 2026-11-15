@@ -11,25 +11,29 @@ redefining any of those types.
 
 ```toml
 # Cargo.toml (workspace)
-sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", rev = "98172513625384ad2f79c238aaefb7d6e0dde752" }
+sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", branch = "main" }
 ```
 
-- The dependency is pinned to an exact commit, and `Cargo.lock` records it, so
-  every build sees the same contract. A contract change is always a deliberate
-  pin update in a reviewed pull request.
+- The dependency tracks sendbox `main`, and `Cargo.lock` records the exact
+  commit. CI builds with `--locked`, so every build sees the same contract
+  until the lockfile moves.
+- [Dependabot](../.github/dependabot.yml) checks sendbox `main` daily and opens
+  a pull request that moves `Cargo.lock` to the latest commit. The
+  [auto-merge workflow](../.github/workflows/dependabot-auto-merge.yml) enables
+  auto-merge on those pull requests, and branch protection merges them only
+  after every CI job passes. A contract change that breaks this service leaves
+  the pull request open with failing checks for a maintainer to fix.
 - `sendbox-governance` inherits versions from the sendbox workspace and
   depends on `sendbox-core` by path; Cargo resolves both from the same git
   checkout.
-- The pinned commit is the merge of increment 1
-  ([mbianchidev/sendbox#93](https://github.com/mbianchidev/sendbox/pull/93))
-  on sendbox `main`, so the revision cannot disappear when feature branches
-  are rewritten or deleted. Only pin to commits on `main` or to release tags.
+- Only `main` is tracked, so the recorded commit cannot disappear when sendbox
+  feature branches are rewritten or deleted.
 
-To update the pin:
+To move the lockfile by hand, to the latest `main` commit or to a specific one:
 
 ```sh
-# edit `rev` in Cargo.toml, then
 cargo update -p sendbox-governance
+cargo update -p sendbox-governance --precise <commit-sha>
 cargo test --locked --workspace
 ```
 
