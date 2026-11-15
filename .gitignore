@@ -1,0 +1,13 @@
+# Rust build output
+/target/
+
+# Local configuration and secrets
+.env
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+
+# Application logs
+logs/
