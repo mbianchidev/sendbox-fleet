@@ -6,6 +6,7 @@ use std::sync::Arc;
 use sendbox_governance::{Clock, GovernanceError};
 use sendbox_security::provenance::TrustStore;
 
+use crate::config::TokenLimits;
 use crate::db::Database;
 use crate::problem::Problem;
 
@@ -20,6 +21,10 @@ pub struct AppState {
     /// Operator signers that profile publications must satisfy. Publication
     /// is refused while this is unset.
     pub profile_trust: Option<TrustStore>,
+    pub tokens: TokenLimits,
+    /// Signs audit chain heads; `None` disables `GET /v1/audit/head`.
+    pub audit_signer: Option<Arc<crate::anchor::AuditSigner>>,
+    pub limits: Arc<crate::ratelimit::Limits>,
 }
 
 impl AppState {

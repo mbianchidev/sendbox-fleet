@@ -1,7 +1,8 @@
 //! Deletes inactive log files older than the retention window.
 //!
-//! Only regular files named `sendbox-fleet.YYYY-MM-DD.log` directly inside the
-//! log directory are candidates; symlinks, directories, and every other file
+//! Only regular files named `sendbox-fleet.YYYY-MM-DD.log` (or a size-rotated
+//! part `sendbox-fleet.YYYY-MM-DD.N.log`) directly inside the log directory are
+//! candidates; symlinks, directories, and every other file
 //! are left untouched. A file's age comes from the UTC date in its name, not
 //! its modification time, so copying or touching a file does not extend its
 //! retention. A file is deleted when its last possible record (the end of its
@@ -62,13 +63,25 @@ pub fn enforce(
     Ok(report)
 }
 
-/// The UTC day encoded in a file name produced by the daily appender.
+/// The UTC day encoded in a file name produced by the log writer.
 fn log_file_day(name: &str) -> Option<Date> {
-    let date = name
+    let stem = name
         .strip_prefix(LOG_FILE_PREFIX)?
         .strip_prefix('.')?
         .strip_suffix(LOG_FILE_SUFFIX)?
         .strip_suffix('.')?;
+    let date = match stem.split_once('.') {
+        None => stem,
+        Some((date, part))
+            if !part.is_empty()
+                && part.len() <= 4
+                && !part.starts_with('0')
+                && part.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            date
+        }
+        Some(_) => return None,
+    };
     let bytes = date.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return None;
@@ -114,6 +127,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for name in [
             "sendbox-fleet.2026-09-01.log",
+            "sendbox-fleet.2026-09-01.12.log",
             "sendbox-fleet.2026-10-15.log",
             "sendbox-fleet.2026-10-16.log",
             "sendbox-fleet.2026-11-15.log",
@@ -124,6 +138,7 @@ mod tests {
         assert_eq!(
             deleted_names(&report),
             [
+                "sendbox-fleet.2026-09-01.12.log",
                 "sendbox-fleet.2026-09-01.log",
                 "sendbox-fleet.2026-10-15.log"
             ]
@@ -149,6 +164,8 @@ mod tests {
             "sendbox-fleet.2020-01-01.txt",
             "sendbox-fleet.2020-13-01.log",
             "sendbox-fleet.2020-1-01.log",
+            "sendbox-fleet.2020-01-01.01.log",
+            "sendbox-fleet.2020-01-01.x.log",
             "sendbox-fleet.log",
         ];
         for name in keep {

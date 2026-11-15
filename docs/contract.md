@@ -54,6 +54,8 @@ cargo test --locked --workspace
 | `PolicyException`, `ExceptionScope`, `ExceptionId`, `api::ExceptionList` | `/v1/exceptions` responses; scopes are checked with `GovernanceProfile::permits_exception` |
 | `ProjectId`, `PrincipalId` | Role, exception, and audit endpoints |
 | `Sha256Digest`, `canonical_digest` | Digests in responses, binding storage, and audit event hashes |
+| `api::TokenRequest`, `api::IssuedToken` | `POST /v1/tokens` body and response |
+| `api::RequestOutcomeReport`, `api::ReportedOutcome` | `POST /v1/grants/{grant}:outcome` body, checked with `RequestOutcomeReport::validate` |
 
 Validation is the contract's own: identifier grammars, `deny_unknown_fields`,
 `GovernanceBinding::validate`, `validate_method`, `validate_path_prefix`, and
@@ -62,8 +64,8 @@ Validation is the contract's own: identifier grammars, `deny_unknown_fields`,
 Wire types a SendBox host also uses live in `sendbox_governance::api`. Types
 only people use live here, in the route module that uses them:
 `CreateProject`, `ProjectRole` and `RoleBinding`, `ExceptionRequest`,
-`ProfilePublication` and `MinimumRevision`, and the audit query, page, and
-event types. Profile signatures use SendBox's signing envelope
+`ProfilePublication` and `MinimumRevision`, `TokenSummary` and `TokenList`,
+and the audit query, page, event, and signed-head types. Profile signatures use SendBox's signing envelope
 (`sendbox_security::provenance::DetachedSignature` in a
 `sendbox.governance-signatures` bundle), verified with the same trust store
 code as hosts.

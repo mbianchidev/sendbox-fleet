@@ -51,22 +51,36 @@ invariants, CI, and these documents. Increment 2 then delivered:
 - **Central audit** (AC6, AC7). Hash-chained events for every decision with
   actor, principal, project, session, grant, exception, revision, decision,
   redacted target, and detail; role-scoped queries; chain verification.
+- **Identity providers** (AC7). Any OpenID Connect issuer for people and
+  machine identities such as GitHub Actions: JWKS verification with `ring`
+  (`RS256`, `ES256`, `EdDSA`), exact issuer and audience, required claims,
+  verified email, optional auto-provisioning without roles. `POST
+  /v1/tokens` exchanges a sign-in for a short-lived service token, which
+  `sendbox governance login` stores on the host; tokens can be listed and
+  revoked.
+- **Outcomes and anchoring** (AC6, AC7). Hosts report each brokered stream's
+  outcome (`succeeded`, `failed`, `unknown`) to `POST
+  /v1/grants/{grant}:outcome`, recorded as `request.outcome`. Chain heads are
+  signed (`GET /v1/audit/head`), written periodically to an anchor directory,
+  and checked with `sendbox-fleet admin audit verify`.
+- **Operations** (AC8). Least-privilege PostgreSQL roles
+  (`deploy/postgres/roles.sql`, no `UPDATE`/`DELETE` on audit for the
+  runtime role), `FLEET_MIGRATE=false` with `admin migrate`, per-principal and
+  per-peer rate limits, Prometheus metrics on a separate listener, size and
+  daily log rotation, and [deployment](deployment.md) guidance for TLS,
+  identity providers, anchoring, metrics, and backups.
+- **Dependencies.** Rust 1.100.0 and sqlx 0.9, which removed the unused
+  `rsa` advisory exception.
 
 ## Remaining
 
-1. **Identity provider** (AC7 hardening). Replace or complement admin-issued
-   tokens with OIDC for people and mTLS or signed short-lived tokens for
-   workers; self-service token issuance.
-2. **Live end-to-end runs.** Run Apple and Kata governed sessions against a
-   deployed fleet and real model providers.
-3. **Audit anchoring and outcomes.** Anchor chain heads outside the database;
-   accept host-reported stream outcomes (`succeeded`, `failed`, `unknown`).
-4. **Operations** (AC8). TLS termination guidance, rate limiting, metrics,
-   backups, database role hardening (no `UPDATE`/`DELETE` on audit),
-   deployment docs, and size-based log rotation.
-5. **Dependency follow-ups.** Move the contract pin to a merged sendbox
-   commit; upgrade to sqlx 0.9 once the toolchain moves to Rust 1.94 or later
-   and drop the `cargo audit` exceptions in `.cargo/audit.toml`.
+1. **Live end-to-end runs.** Run Apple and Kata governed sessions against a
+   deployed fleet and real model providers. The provider path (broker,
+   relay, credential injection) is host-side, so this is tracked in SendBox:
+   [mbianchidev/sendbox#96](https://github.com/mbianchidev/sendbox/issues/96).
+2. **`RUSTSEC-2026-0459`.** Drop the exception in `.cargo/audit.toml` once an
+   sqlx release allows libsqlite3-sys 0.39. It affects only SQLite, which
+   production does not use.
 
 ## Non-goals
 

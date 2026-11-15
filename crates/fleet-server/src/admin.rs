@@ -3,6 +3,10 @@
 //! meant for whoever operates the service host. Every change is audited with
 //! the actor `cli:admin`.
 
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::PathBuf;
+
 use clap::{Args, Subcommand, ValueEnum};
 use sendbox_governance::{Clock, PrincipalId, ProjectId, SystemClock};
 
@@ -28,6 +32,35 @@ pub enum AdminCommand {
     /// Create projects with their first owner.
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// Sign, anchor, and verify the audit chain.
+    #[command(subcommand)]
+    Audit(AuditCommand),
+    /// Apply pending database migrations, for deployments that run the
+    /// service with `FLEET_MIGRATE=false` and a least-privilege role.
+    Migrate,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuditCommand {
+    /// Create an audit signing key (mode 0600) and print its public identity.
+    Keygen {
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+    /// Write the current chain head, signed with FLEET_AUDIT_SIGNING_KEY, into
+    /// DIR (for example a write-once bucket mount).
+    Anchor {
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+    },
+    /// Recompute the whole chain and check every given anchor against it.
+    Verify {
+        /// Public identity printed by `audit keygen` (JSON).
+        #[arg(long, value_name = "PATH")]
+        identity: Option<PathBuf>,
+        #[arg(long = "anchor", value_name = "FILE")]
+        anchors: Vec<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -91,6 +124,10 @@ pub enum AdminError {
     #[error("{0}")]
     Invalid(String),
     #[error(transparent)]
+    Anchor(#[from] crate::anchor::AnchorError),
+    #[error("audit verification failed")]
+    Unverified,
+    #[error(transparent)]
     Database(#[from] DbError),
     #[error("{}", .0.detail)]
     Refused(Problem),
@@ -138,13 +175,126 @@ fn display_name(value: Option<String>) -> Result<Option<String>, AdminError> {
 }
 
 /// Runs one admin command. Results go to stdout; a new token is the only
-/// thing printed for `token issue`.
-pub async fn run(url: &DatabaseUrl, command: AdminCommand) -> Result<(), AdminError> {
+/// thing printed for `token issue`. Pending migrations are applied first
+/// unless `migrate` is false (`FLEET_MIGRATE=false`), in which case only
+/// `admin migrate` changes the schema.
+pub async fn run(
+    url: &DatabaseUrl,
+    migrate: bool,
+    command: AdminCommand,
+) -> Result<(), AdminError> {
+    if let AdminCommand::Audit(AuditCommand::Keygen { output }) = &command {
+        return keygen(output);
+    }
     let database = Database::connect(url).await?;
-    database.migrate().await?;
-    let result = execute(&database, command, SystemClock.now_unix()).await;
+    if migrate || matches!(command, AdminCommand::Migrate) {
+        database.migrate().await?;
+    } else {
+        database.check_migrated().await?;
+    }
+    let result = match command {
+        AdminCommand::Migrate => {
+            println!("migrations applied");
+            Ok(())
+        }
+        AdminCommand::Audit(audit) => run_audit(&database, audit).await,
+        command => execute(&database, command, SystemClock.now_unix()).await,
+    };
     database.close().await;
     result
+}
+
+/// Creates an audit signing key; needs no database.
+pub fn keygen(output: &std::path::Path) -> Result<(), AdminError> {
+    let key = sendbox_security::provenance::SigningKeyMaterial::generate()
+        .map_err(|error| AdminError::Invalid(format!("generate key: {error}")))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(output)
+        .map_err(|error| AdminError::Invalid(format!("create {}: {error}", output.display())))?;
+    file.write_all(key.export().as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|error| AdminError::Invalid(format!("write {}: {error}", output.display())))?;
+    let identity = crate::anchor::AuditSigner::from_key(key).identity;
+    eprintln!(
+        "audit signing key written to {}; keep it out of the database host's backups. Public identity:",
+        output.display()
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&identity)
+            .map_err(|error| AdminError::Invalid(error.to_string()))?
+    );
+    Ok(())
+}
+
+async fn run_audit(database: &Database, command: AuditCommand) -> Result<(), AdminError> {
+    match command {
+        AuditCommand::Keygen { .. } => Err(AdminError::Invalid("unreachable".to_owned())),
+        AuditCommand::Anchor { output } => {
+            let key = std::env::var_os(crate::config::AUDIT_SIGNING_KEY_VAR).ok_or_else(|| {
+                AdminError::Invalid(format!(
+                    "{} is required",
+                    crate::config::AUDIT_SIGNING_KEY_VAR
+                ))
+            })?;
+            let signer = crate::anchor::AuditSigner::load(std::path::Path::new(&key))?;
+            let authority = std::env::var(crate::config::AUTHORITY_ID_VAR)
+                .unwrap_or_else(|_| "sendbox-fleet".to_owned());
+            let head = crate::anchor::current_head(database, &authority, SystemClock.now_unix())
+                .await
+                .map_err(AdminError::Refused)?;
+            let signed = signer.sign(head)?;
+            match crate::anchor::write_anchor(&output, &signed)? {
+                Some(path) => println!(
+                    "anchored sequence {} in {}",
+                    signed.head.sequence,
+                    path.display()
+                ),
+                None => println!("sequence {} is already anchored", signed.head.sequence),
+            }
+            Ok(())
+        }
+        AuditCommand::Verify { identity, anchors } => {
+            let chain = crate::audit::verify_chain(database)
+                .await
+                .map_err(AdminError::Refused)?;
+            println!(
+                "{}",
+                serde_json::to_string(&chain)
+                    .map_err(|error| AdminError::Invalid(error.to_string()))?
+            );
+            let mut valid = chain.valid;
+            if !anchors.is_empty() {
+                let path = identity.ok_or_else(|| {
+                    AdminError::Invalid("--identity is required to check anchors".to_owned())
+                })?;
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    AdminError::Invalid(format!("read {}: {error}", path.display()))
+                })?;
+                let identity: sendbox_security::provenance::Identity =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        AdminError::Invalid(format!("{}: {error}", path.display()))
+                    })?;
+                for anchor in anchors {
+                    let check = crate::anchor::check_anchor(database, &identity, &anchor).await?;
+                    valid &= check.valid;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&check)
+                            .map_err(|error| AdminError::Invalid(error.to_string()))?
+                    );
+                }
+            }
+            if valid {
+                Ok(())
+            } else {
+                Err(AdminError::Unverified)
+            }
+        }
+    }
 }
 
 async fn execute(database: &Database, command: AdminCommand, now: u64) -> Result<(), AdminError> {
@@ -324,6 +474,11 @@ async fn execute(database: &Database, command: AdminCommand, now: u64) -> Result
             )
             .await?;
             println!("revoked token {token_id}");
+        }
+        AdminCommand::Audit(_) | AdminCommand::Migrate => {
+            return Err(AdminError::Invalid(
+                "handled before the transaction".to_owned(),
+            ));
         }
         AdminCommand::Project(ProjectCommand::Create {
             project,

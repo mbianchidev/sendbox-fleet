@@ -38,7 +38,8 @@ pub struct AuditPage {
 pub fn configure(config: &mut web::ServiceConfig) {
     config
         .service(resource("/audit/events").route(web::get().to(list)))
-        .service(resource("/audit/verify").route(web::get().to(verify)));
+        .service(resource("/audit/verify").route(web::get().to(verify)))
+        .service(resource("/audit/head").route(web::get().to(head)));
 }
 
 async fn list(
@@ -96,4 +97,24 @@ async fn verify(
 ) -> Result<web::Json<ChainVerification>, Problem> {
     require_operator(&caller, "verify the audit chain")?;
     Ok(web::Json(audit::verify_chain(&state.database).await?))
+}
+
+/// The current chain head, signed with the service's audit key, for storage
+/// outside the database.
+async fn head(
+    state: State,
+    Authenticated(caller): Authenticated,
+) -> Result<web::Json<crate::anchor::SignedAuditHead>, Problem> {
+    require_operator(&caller, "read the signed audit head")?;
+    let signer = state.audit_signer.as_ref().ok_or_else(|| {
+        Problem::service_unavailable(
+            "the audit signing key is not configured; set FLEET_AUDIT_SIGNING_KEY",
+        )
+    })?;
+    let head =
+        crate::anchor::current_head(&state.database, &state.authority_id, state.now()).await?;
+    signer.sign(head).map(web::Json).map_err(|error| {
+        tracing::error!(%error, "audit head signing failed");
+        Problem::internal()
+    })
 }

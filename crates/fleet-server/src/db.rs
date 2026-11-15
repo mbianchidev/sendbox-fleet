@@ -34,6 +34,10 @@ pub enum DbError {
     Migrate(#[from] MigrateError),
     #[error("database query failed: {0}")]
     Query(#[from] sqlx::Error),
+    #[error(
+        "migrations {0} are not applied; run `sendbox-fleet admin migrate` with a schema-owner role"
+    )]
+    Pending(String),
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +125,46 @@ impl Database {
         Ok(())
     }
 
+    /// Fails unless every embedded migration has been applied successfully,
+    /// for deployments whose runtime role cannot change the schema.
+    pub async fn check_migrated(&self) -> Result<(), DbError> {
+        let migrator = match self {
+            Self::Postgres(_) => &POSTGRES_MIGRATIONS,
+            Self::Sqlite(_) => &SQLITE_MIGRATIONS,
+        };
+        let ledger = match self {
+            Self::Postgres(_) => {
+                "SELECT 1 AS present WHERE to_regclass('_sqlx_migrations') IS NOT NULL"
+            }
+            Self::Sqlite(_) => {
+                "SELECT 1 AS present FROM sqlite_master \
+                 WHERE type = 'table' AND name = '_sqlx_migrations'"
+            }
+        };
+        let applied = if self.fetch_optional(ledger, &[]).await?.is_some() {
+            self.fetch_all(
+                "SELECT version FROM _sqlx_migrations WHERE success = TRUE",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| row.int("version"))
+            .collect::<Result<std::collections::BTreeSet<i64>, _>>()?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let missing = migrator
+            .iter()
+            .filter(|migration| !applied.contains(&migration.version))
+            .map(|migration| migration.version.to_string())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Pending(missing.join(", ")))
+        }
+    }
+
     /// Round-trips a trivial query; used by the readiness probe.
     pub async fn ping(&self) -> Result<(), DbError> {
         match self {
@@ -161,13 +205,13 @@ impl Database {
     /// Runs a read-only query outside a transaction.
     pub async fn fetch_all(&self, sql: &str, args: &[Arg]) -> Result<Vec<Row>, DbError> {
         match self {
-            Self::Postgres(pool) => Ok(bind_pg(sqlx::query(sql), args)
+            Self::Postgres(pool) => Ok(bind_pg(sqlx::query(statement(sql)), args)
                 .fetch_all(pool)
                 .await?
                 .into_iter()
                 .map(Row::Postgres)
                 .collect()),
-            Self::Sqlite(pool) => Ok(bind_sqlite(sqlx::query(sql), args)
+            Self::Sqlite(pool) => Ok(bind_sqlite(sqlx::query(statement(sql)), args)
                 .fetch_all(pool)
                 .await?
                 .into_iter()
@@ -246,8 +290,14 @@ impl From<Vec<u8>> for Arg {
     }
 }
 
+/// Statements are assembled only from constant SQL fragments and generated
+/// placeholders; every value is bound as a parameter, never interpolated.
+fn statement(sql: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(sql.to_owned())
+}
+
 type PgQuery<'q> = sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>;
-type SqliteQuery<'q> = sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+type SqliteQuery<'q> = sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>;
 
 fn bind_pg<'q>(mut query: PgQuery<'q>, args: &'q [Arg]) -> PgQuery<'q> {
     for arg in args {
@@ -296,11 +346,11 @@ impl Tx {
     /// Executes a statement and returns the number of affected rows.
     pub async fn execute(&mut self, sql: &str, args: &[Arg]) -> Result<u64, DbError> {
         Ok(match self {
-            Self::Postgres(transaction) => bind_pg(sqlx::query(sql), args)
+            Self::Postgres(transaction) => bind_pg(sqlx::query(statement(sql)), args)
                 .execute(&mut **transaction)
                 .await?
                 .rows_affected(),
-            Self::Sqlite(transaction) => bind_sqlite(sqlx::query(sql), args)
+            Self::Sqlite(transaction) => bind_sqlite(sqlx::query(statement(sql)), args)
                 .execute(&mut **transaction)
                 .await?
                 .rows_affected(),
@@ -309,13 +359,13 @@ impl Tx {
 
     pub async fn fetch_all(&mut self, sql: &str, args: &[Arg]) -> Result<Vec<Row>, DbError> {
         Ok(match self {
-            Self::Postgres(transaction) => bind_pg(sqlx::query(sql), args)
+            Self::Postgres(transaction) => bind_pg(sqlx::query(statement(sql)), args)
                 .fetch_all(&mut **transaction)
                 .await?
                 .into_iter()
                 .map(Row::Postgres)
                 .collect(),
-            Self::Sqlite(transaction) => bind_sqlite(sqlx::query(sql), args)
+            Self::Sqlite(transaction) => bind_sqlite(sqlx::query(statement(sql)), args)
                 .fetch_all(&mut **transaction)
                 .await?
                 .into_iter()

@@ -2,14 +2,11 @@
 # condition; revisit them whenever dependencies or the toolchain change.
 [advisories]
 ignore = [
-    # rsa (Marvin attack). Listed in Cargo.lock only because sqlx-macros-core
-    # declares optional MySQL support; it is never compiled
-    # (`cargo tree -i rsa` prints nothing). Remove with the sqlx 0.9 upgrade.
-    "RUSTSEC-2023-0071",
-    # libsqlite3-sys bundles SQLite < 3.54 (stale page-cache bytes when an
-    # attacker-written database and -wal file are opened together). SQLite is
-    # only used for local development and tests, on files the service creates
-    # itself. The fix needs sqlx 0.9, which requires Rust 1.94; this workspace
-    # is pinned to Rust 1.93.1 to match SendBox. Remove when the toolchain moves.
+    # libsqlite3-sys bundles SQLite older than the fix (stale page-cache bytes
+    # when an attacker-written database and -wal file are opened together).
+    # The fix is libsqlite3-sys 0.39, but sqlx-sqlite 0.9.0 requires < 0.38, so
+    # 0.37 is the newest usable release. SQLite is only used for local
+    # development and tests, on files the service creates itself; production
+    # uses PostgreSQL. Remove when an sqlx release allows libsqlite3-sys 0.39.
     "RUSTSEC-2026-0459",
 ]

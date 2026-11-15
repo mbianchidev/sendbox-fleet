@@ -25,6 +25,8 @@ pub struct Problem {
     pub capability: Option<&'static str>,
     #[serde(skip)]
     challenge: Option<&'static str>,
+    #[serde(skip)]
+    retry_after: Option<u64>,
 }
 
 impl Problem {
@@ -41,6 +43,7 @@ impl Problem {
             detail,
             capability: None,
             challenge: None,
+            retry_after: None,
         }
     }
 
@@ -117,6 +120,18 @@ impl Problem {
         }
     }
 
+    /// A 429 with `Retry-After`.
+    #[must_use]
+    pub fn too_many_requests(retry_after_seconds: u64) -> Self {
+        Self {
+            retry_after: Some(retry_after_seconds),
+            ..Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("rate limit exceeded; retry after {retry_after_seconds} seconds"),
+            )
+        }
+    }
+
     #[must_use]
     pub fn service_unavailable(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, detail)
@@ -142,6 +157,9 @@ impl ResponseError for Problem {
             .insert_header((header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
         if let Some(challenge) = self.challenge {
             response.insert_header((header::WWW_AUTHENTICATE, challenge));
+        }
+        if let Some(seconds) = self.retry_after {
+            response.insert_header((header::RETRY_AFTER, seconds.to_string()));
         }
         response.json(self)
     }

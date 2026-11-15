@@ -7,6 +7,7 @@
 
 use fleet_server::config::{DatabaseKind, DatabaseUrl};
 use fleet_server::db::Database;
+use sqlx::AssertSqlSafe;
 
 const TABLES: [&str; 12] = [
     "api_tokens",
@@ -27,9 +28,19 @@ const SESSION: &str = "0123456789abcdef0123456789abcdef";
 const PROFILE_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const BINDING_SHA: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
+fn test_url() -> String {
+    std::env::var("FLEET_TEST_DATABASE_URL").unwrap_or_else(|_| "sqlite::memory:".to_owned())
+}
+
 async fn database() -> Database {
-    let url =
-        std::env::var("FLEET_TEST_DATABASE_URL").unwrap_or_else(|_| "sqlite::memory:".to_owned());
+    let database = unmigrated().await;
+    database.migrate().await.unwrap();
+    database
+}
+
+/// A connection to an empty schema.
+async fn unmigrated() -> Database {
+    let url = test_url();
     let database = Database::connect(&DatabaseUrl::parse(&url).unwrap())
         .await
         .unwrap();
@@ -47,22 +58,35 @@ async fn database() -> Database {
             .await
             .unwrap();
     }
-    database.migrate().await.unwrap();
     database
 }
 
 async fn exec(database: &Database, sql: &str) -> Result<(), sqlx::Error> {
     match database {
-        Database::Postgres(pool) => sqlx::raw_sql(sql).execute(pool).await.map(drop),
-        Database::Sqlite(pool) => sqlx::raw_sql(sql).execute(pool).await.map(drop),
+        Database::Postgres(pool) => sqlx::raw_sql(AssertSqlSafe(sql.to_owned()))
+            .execute(pool)
+            .await
+            .map(drop),
+        Database::Sqlite(pool) => sqlx::raw_sql(AssertSqlSafe(sql.to_owned()))
+            .execute(pool)
+            .await
+            .map(drop),
     }
 }
 
 async fn count(database: &Database, table: &str) -> i64 {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     match database {
-        Database::Postgres(pool) => sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await,
-        Database::Sqlite(pool) => sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await,
+        Database::Postgres(pool) => {
+            sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql.clone()))
+                .fetch_one(pool)
+                .await
+        }
+        Database::Sqlite(pool) => {
+            sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql.clone()))
+                .fetch_one(pool)
+                .await
+        }
     }
     .unwrap()
 }
@@ -319,4 +343,78 @@ async fn tokens_are_digests_with_bounded_lifetimes() {
          'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 0, 10)",
     )
     .await;
+}
+
+#[actix_web::test]
+async fn startup_without_migrations_needs_an_applied_schema() {
+    let database = unmigrated().await;
+    let error = database.check_migrated().await.unwrap_err().to_string();
+    assert!(error.contains("migrations 1, 2 are not applied"), "{error}");
+    assert!(error.contains("sendbox-fleet admin migrate"), "{error}");
+    database.migrate().await.unwrap();
+    database.check_migrated().await.unwrap();
+    exec(&database, "DELETE FROM _sqlx_migrations WHERE version = 2")
+        .await
+        .unwrap();
+    let error = database.check_migrated().await.unwrap_err().to_string();
+    assert!(error.contains("migrations 2 are not applied"), "{error}");
+}
+
+/// `deploy/postgres/roles.sql`: the runtime role cannot rewrite the audit
+/// log, the migration ledger, or the schema. PostgreSQL only.
+#[actix_web::test]
+async fn postgres_runtime_role_keeps_the_audit_log_append_only() {
+    let url = test_url();
+    if !url.starts_with("postgres") {
+        return;
+    }
+    let script = include_str!("../../../deploy/postgres/roles.sql");
+    let admin = unmigrated().await;
+    exec(&admin, script).await.unwrap();
+    let as_role = |role: &str| {
+        let mut url = url::Url::parse(&url).unwrap();
+        url.set_username(role).unwrap();
+        url.set_password(None).unwrap();
+        DatabaseUrl::parse(url.as_str()).unwrap()
+    };
+    let owner = Database::connect(&as_role("sendbox_fleet_owner"))
+        .await
+        .unwrap();
+    owner.migrate().await.unwrap();
+    exec(&admin, script).await.unwrap();
+    let app = Database::connect(&as_role("sendbox_fleet_app"))
+        .await
+        .unwrap();
+    app.check_migrated().await.unwrap();
+
+    accept(
+        &app,
+        "INSERT INTO principals (id, kind, created_at_unix) VALUES ('oidc:a@example.com', 'user', 0)",
+    )
+    .await;
+    accept(
+        &app,
+        "UPDATE principals SET disabled_at_unix = 1 WHERE id = 'oidc:a@example.com'",
+    )
+    .await;
+    accept(&app, &audit_sql(1, ZERO_HASH, &"1".repeat(64))).await;
+    for statement in [
+        "UPDATE audit_events SET outcome = 'failed'",
+        "DELETE FROM audit_events",
+        "TRUNCATE audit_events",
+        "ALTER TABLE audit_events DISABLE TRIGGER USER",
+        "DROP TRIGGER audit_events_reject_update_delete ON audit_events",
+        "DELETE FROM _sqlx_migrations",
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (99, 'x', TRUE, '\\x00', 0)",
+        "CREATE TABLE extra (id INTEGER)",
+        "DROP TABLE principals CASCADE",
+    ] {
+        let error = exec(&app, statement).await.unwrap_err().to_string();
+        assert!(
+            error.contains("permission denied") || error.contains("must be owner"),
+            "{statement}: {error}"
+        );
+    }
+    assert_eq!(count(&admin, "audit_events").await, 1);
 }
