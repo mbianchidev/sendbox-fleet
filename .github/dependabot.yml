@@ -1,12 +1,19 @@
 version: 2
 updates:
-  # Keeps the sendbox-governance contract on the latest sendbox `main` commit.
-  # See docs/contract.md.
+  # Keeps the SendBox contract crates on the latest sendbox `main` commit, in
+  # one pull request. Both come from the same git checkout, so they always
+  # move together. See docs/contract.md.
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: daily
     allow:
       - dependency-name: sendbox-governance
+      - dependency-name: sendbox-security
+    groups:
+      sendbox-contract:
+        patterns:
+          - sendbox-governance
+          - sendbox-security
     commit-message:
       prefix: "Bump contract"
