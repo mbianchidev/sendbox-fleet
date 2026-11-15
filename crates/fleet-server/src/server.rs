@@ -14,10 +14,11 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 
-use crate::auth::{self, DatabaseAuthenticator, SharedAuthenticator};
+use crate::auth::{self, FleetAuthenticator, SharedAuthenticator};
 use crate::config::{Config, ConfigError, ProfileTrust};
 use crate::db::{Database, DbError};
 use crate::logging::{self, retention};
+use crate::oidc::{OidcConfig, OidcVerifier};
 use crate::problem;
 use crate::routes;
 use crate::state::{AppState, os_random};
@@ -30,6 +31,8 @@ const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub enum ServerError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    Anchor(#[from] crate::anchor::AnchorError),
     #[error(transparent)]
     Database(#[from] DbError),
     #[error("cannot listen on {address}: {source}")]
@@ -70,9 +73,39 @@ pub async fn run(config: Config, log_dir: PathBuf) -> Result<(), ServerError> {
         .as_deref()
         .map(ProfileTrust::load)
         .transpose()?;
+    let audit_signer = config
+        .audit
+        .signing_key
+        .as_deref()
+        .map(crate::anchor::AuditSigner::load)
+        .transpose()?
+        .map(Arc::new);
+    if let Some(directory) = &config.audit.directory {
+        std::fs::create_dir_all(directory).map_err(|source| crate::anchor::AnchorError::Io {
+            context: "create audit anchor directory",
+            path: directory.clone(),
+            source,
+        })?;
+    }
     let retention = spawn_retention(log_dir.clone(), config.logging.retention_days);
     let database = Database::connect(&config.database_url).await?;
-    database.migrate().await?;
+    if config.migrate {
+        database.migrate().await?;
+    } else {
+        database.check_migrated().await?;
+    }
+    match database
+        .fetch_optional("SELECT MAX(sequence) AS head FROM audit_events", &[])
+        .await
+    {
+        Ok(Some(row)) => {
+            if let Ok(Some(head)) = row.opt_int("head") {
+                crate::metrics::METRICS.audit_head(u64::try_from(head).unwrap_or(0));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "cannot read the audit chain head for metrics"),
+    }
     tracing::info!(
         bind = %config.bind,
         database = %config.database_url,
@@ -88,16 +121,66 @@ pub async fn run(config: Config, log_dir: PathBuf) -> Result<(), ServerError> {
     }
 
     let clock: Arc<dyn sendbox_governance::Clock> = Arc::new(sendbox_governance::SystemClock);
+    let oidc = config
+        .oidc
+        .as_deref()
+        .map(OidcConfig::load)
+        .transpose()?
+        .map(|oidc| OidcVerifier::new(oidc, Arc::clone(&clock)))
+        .transpose()?;
+    if oidc.is_none() {
+        tracing::info!("FLEET_OIDC_CONFIG is not set; only service tokens authenticate");
+    }
     let state = web::Data::new(AppState {
         database: database.clone(),
         clock: Arc::clone(&clock),
         random: Arc::new(os_random),
         authority_id: config.authority_id.clone(),
         profile_trust,
+        tokens: config.tokens,
+        audit_signer: audit_signer.clone(),
+        limits: Arc::new(crate::ratelimit::Limits {
+            requests: crate::ratelimit::RateLimiter::new(config.rate_limit_per_minute),
+            auth_failures: crate::ratelimit::RateLimiter::new(config.auth_failures_per_minute),
+        }),
     });
-    let authenticator = auth::shared(Arc::new(DatabaseAuthenticator::new(
+    let metrics = match config.metrics_bind {
+        Some(address) => {
+            let server = HttpServer::new(|| App::new().configure(crate::metrics::configure))
+                .workers(1)
+                .shutdown_timeout(5)
+                .bind(address)
+                .map_err(|source| ServerError::Bind { address, source })?
+                .run();
+            let handle = server.handle();
+            actix_web::rt::spawn(server);
+            tracing::info!(%address, "serving metrics");
+            Some(handle)
+        }
+        None => None,
+    };
+    let anchoring = match (&audit_signer, &config.audit.directory) {
+        (Some(signer), Some(directory)) => {
+            tracing::info!(
+                directory = %directory.display(),
+                fingerprint = %signer.identity.fingerprint,
+                "anchoring the audit chain head"
+            );
+            Some(crate::anchor::spawn_anchoring(
+                database.clone(),
+                Arc::clone(signer),
+                config.authority_id.clone(),
+                directory.clone(),
+                Duration::from_secs(config.audit.interval_seconds),
+                Arc::clone(&clock),
+            ))
+        }
+        _ => None,
+    };
+    let authenticator = auth::shared(Arc::new(FleetAuthenticator::new(
         database.clone(),
         clock,
+        oidc,
     )));
     let server = HttpServer::new(move || app(state.clone(), authenticator.clone()))
         .shutdown_timeout(SHUTDOWN_GRACE_SECONDS)
@@ -109,7 +192,13 @@ pub async fn run(config: Config, log_dir: PathBuf) -> Result<(), ServerError> {
         .run();
     let served = server.await.map_err(ServerError::Serve);
 
+    if let Some(metrics) = metrics {
+        metrics.stop(true).await;
+    }
     retention.abort();
+    if let Some(anchoring) = anchoring {
+        anchoring.abort();
+    }
     database.close().await;
     tracing::info!("sendbox-fleet stopped");
     served

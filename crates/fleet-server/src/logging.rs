@@ -1,12 +1,14 @@
-//! Structured logging to stdout and a daily-rotated `.log` file.
+//! Structured logging to stdout and a rotated `.log` file.
 //!
 //! Both sinks receive the same JSON-lines events. The file sink rotates at
-//! each UTC calendar day (`sendbox-fleet.YYYY-MM-DD.log`) and
+//! each UTC calendar day (`sendbox-fleet.YYYY-MM-DD.log`) and whenever a file
+//! reaches the configured size (`sendbox-fleet.YYYY-MM-DD.N.log`);
 //! [`retention`] removes inactive files once they are older than the
 //! configured retention window. Request bodies, headers, and query strings are
 //! never logged.
 
 pub mod retention;
+pub mod rotation;
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -19,7 +21,6 @@ use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::middleware::Next;
 use thiserror::Error;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -40,10 +41,7 @@ pub enum LoggingError {
     #[error("cannot create log directory {path}: {source}")]
     CreateDir { path: PathBuf, source: io::Error },
     #[error("cannot open log file in {path}: {source}")]
-    Appender {
-        path: PathBuf,
-        source: tracing_appender::rolling::InitError,
-    },
+    Appender { path: PathBuf, source: io::Error },
     #[error("invalid log filter: {0}")]
     Filter(String),
     #[error("a global tracing subscriber is already installed: {0}")]
@@ -61,15 +59,12 @@ pub struct LoggingGuard {
 pub fn init(config: &LogConfig) -> Result<LoggingGuard, LoggingError> {
     let dir = resolve_dir(&config.dir)?;
     create_private_dir(&dir)?;
-    let appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
-        .filename_prefix(LOG_FILE_PREFIX)
-        .filename_suffix(LOG_FILE_SUFFIX)
-        .build(&dir)
-        .map_err(|source| LoggingError::Appender {
+    let appender = rotation::RotatingFile::new(&dir, config.max_file_bytes).map_err(|source| {
+        LoggingError::Appender {
             path: dir.clone(),
             source,
-        })?;
+        }
+    })?;
     let (file_writer, guard) = NonBlockingBuilder::default()
         .lossy(false)
         .buffered_lines_limit(FILE_QUEUE_LINES)
@@ -143,6 +138,14 @@ pub async fn request_log(
     let started = Instant::now();
     let response = next.call(request).await;
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    crate::metrics::METRICS.request(
+        match &response {
+            Ok(response) => response.status().as_u16(),
+            Err(error) => error.as_response_error().status_code().as_u16(),
+        },
+        micros,
+    );
     match &response {
         Ok(response) => tracing::info!(
             request_id,

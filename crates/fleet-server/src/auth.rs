@@ -7,10 +7,15 @@
 //! `X-Forwarded-User` or a principal field inside a request body, are never
 //! treated as authenticated identity.
 //!
-//! The production authenticator, [`DatabaseAuthenticator`], accepts opaque
-//! tokens issued with `sendbox-fleet admin token issue`. Only their SHA-256 is
-//! stored; a token is accepted while it is unexpired, unrevoked, and its
-//! principal is not disabled.
+//! The production authenticator, [`FleetAuthenticator`], accepts:
+//!
+//! - opaque `sbf_` service tokens, issued by `sendbox-fleet admin token issue`
+//!   or exchanged at `POST /v1/tokens`. Only their SHA-256 is stored; a token
+//!   is accepted while it is unexpired, unrevoked, and its principal is not
+//!   disabled;
+//! - JWTs from identity providers listed in `FLEET_OIDC_CONFIG` (see
+//!   [`crate::oidc`]). The principal must be registered and active, unless its
+//!   issuer allows automatic provisioning.
 
 use std::future::{Future, Ready, ready};
 use std::pin::Pin;
@@ -27,7 +32,9 @@ use sendbox_governance::{Clock, PrincipalId};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::audit::{self, AuditRecord};
 use crate::db::{Arg, Database};
+use crate::oidc::{OidcError, OidcIdentity, OidcVerifier};
 use crate::problem::Problem;
 
 /// Prefix of tokens this service issues, so leaked tokens are recognizable.
@@ -38,6 +45,15 @@ const CHALLENGE: &str = r#"Bearer realm="sendbox-fleet""#;
 const CHALLENGE_INVALID_REQUEST: &str = r#"Bearer realm="sendbox-fleet", error="invalid_request""#;
 const CHALLENGE_INVALID_TOKEN: &str = r#"Bearer realm="sendbox-fleet", error="invalid_token""#;
 
+/// How the caller proved its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// An opaque service token.
+    ServiceToken,
+    /// A JWT from a configured identity provider.
+    IdentityProvider,
+}
+
 /// An authenticated caller. Only an [`Authenticator`] creates one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
@@ -45,6 +61,7 @@ pub struct Caller {
     pub kind: CallerKind,
     /// Fleet-wide operator: publishes profiles and creates projects.
     pub operator: bool,
+    pub method: AuthMethod,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -55,6 +72,8 @@ pub enum AuthError {
     InvalidToken,
     #[error("authentication is temporarily unavailable")]
     Unavailable,
+    #[error("the identity is not registered with this service")]
+    NotRegistered,
 }
 
 pub type AuthFuture<'a> = Pin<Box<dyn Future<Output = Result<Caller, AuthError>> + Send + 'a>>;
@@ -110,12 +129,152 @@ impl Authenticator for DatabaseAuthenticator {
                     principal,
                     kind,
                     operator: row.flag("operator").ok()?,
+                    method: AuthMethod::ServiceToken,
                 })
             })();
             caller.ok_or_else(|| {
                 tracing::error!("stored principal row is invalid");
                 AuthError::Unavailable
             })
+        })
+    }
+}
+
+/// Service tokens and, when configured, identity-provider JWTs.
+pub struct FleetAuthenticator {
+    tokens: DatabaseAuthenticator,
+    oidc: Option<OidcVerifier>,
+    database: Database,
+    clock: Arc<dyn Clock>,
+}
+
+impl FleetAuthenticator {
+    #[must_use]
+    pub fn new(database: Database, clock: Arc<dyn Clock>, oidc: Option<OidcVerifier>) -> Self {
+        Self {
+            tokens: DatabaseAuthenticator::new(database.clone(), Arc::clone(&clock)),
+            oidc,
+            database,
+            clock,
+        }
+    }
+
+    async fn resolve(&self, identity: OidcIdentity) -> Result<Caller, AuthError> {
+        let unavailable = |error: crate::db::DbError| {
+            tracing::error!(%error, "principal lookup failed");
+            AuthError::Unavailable
+        };
+        let lookup = "SELECT kind, is_operator AS operator, disabled_at_unix FROM principals \
+                      WHERE id = $1";
+        let row = self
+            .database
+            .fetch_optional(lookup, &[identity.principal.as_str().into()])
+            .await
+            .map_err(unavailable)?;
+        let expected = match identity.kind {
+            CallerKind::User => "user",
+            CallerKind::Worker => "worker",
+        };
+        if let Some(row) = row {
+            let active = row
+                .opt_int("disabled_at_unix")
+                .map_err(unavailable)?
+                .is_none();
+            let kind = row.text("kind").map_err(unavailable)?;
+            if !active || kind != expected {
+                tracing::info!(
+                    principal = %identity.principal,
+                    issuer = %identity.issuer,
+                    reason = if active { "kind_mismatch" } else { "principal_disabled" },
+                    "identity-provider sign-in refused"
+                );
+                return Err(AuthError::InvalidToken);
+            }
+            return Ok(Caller {
+                principal: identity.principal,
+                kind: identity.kind,
+                operator: row.flag("operator").map_err(unavailable)?,
+                method: AuthMethod::IdentityProvider,
+            });
+        }
+        if !identity.auto_provision {
+            tracing::info!(
+                principal = %identity.principal,
+                issuer = %identity.issuer,
+                reason = "not_registered",
+                "identity-provider sign-in refused"
+            );
+            return Err(AuthError::NotRegistered);
+        }
+        let now = self.clock.now_unix();
+        let mut tx = self.database.begin_write().await.map_err(unavailable)?;
+        let exists = tx
+            .fetch_optional(
+                "SELECT id FROM principals WHERE id = $1",
+                &[identity.principal.as_str().into()],
+            )
+            .await
+            .map_err(unavailable)?
+            .is_some();
+        if !exists {
+            let created = i64::try_from(now).map_err(|_| AuthError::Unavailable)?;
+            tx.execute(
+                "INSERT INTO principals (id, kind, created_at_unix) VALUES ($1, $2, $3)",
+                &[
+                    identity.principal.as_str().into(),
+                    expected.into(),
+                    created.into(),
+                ],
+            )
+            .await
+            .map_err(unavailable)?;
+            audit::append(
+                &mut tx,
+                now,
+                AuditRecord {
+                    event_type: "principal.provisioned",
+                    actor: Some(identity.principal.to_string()),
+                    principal: Some(identity.principal.to_string()),
+                    detail: Some(format!("kind={expected} issuer={}", identity.issuer)),
+                    ..AuditRecord::default()
+                },
+            )
+            .await
+            .map_err(|_| AuthError::Unavailable)?;
+            tx.commit().await.map_err(unavailable)?;
+        }
+        Box::pin(self.resolve(OidcIdentity {
+            auto_provision: false,
+            ..identity
+        }))
+        .await
+    }
+}
+
+impl Authenticator for FleetAuthenticator {
+    fn authenticate<'a>(&'a self, bearer_token: &'a str) -> AuthFuture<'a> {
+        Box::pin(async move {
+            if bearer_token.starts_with(TOKEN_PREFIX) {
+                return self.tokens.authenticate(bearer_token).await;
+            }
+            let Some(oidc) = self
+                .oidc
+                .as_ref()
+                .filter(|_| OidcVerifier::handles(bearer_token))
+            else {
+                return Err(AuthError::InvalidToken);
+            };
+            let identity = oidc
+                .verify(bearer_token)
+                .await
+                .map_err(|error| match error {
+                    OidcError::Rejected(reason) => {
+                        tracing::info!(reason, "identity-provider token rejected");
+                        AuthError::InvalidToken
+                    }
+                    OidcError::Unavailable => AuthError::Unavailable,
+                })?;
+            self.resolve(identity).await
         })
     }
 }
@@ -167,12 +326,44 @@ pub async fn require_bearer(
 }
 
 async fn authenticate(request: &ServiceRequest) -> Result<Caller, Problem> {
-    let token = bearer_token(request.request())?;
+    let limits = request
+        .app_data::<web::Data<crate::state::AppState>>()
+        .map(|state| std::sync::Arc::clone(&state.limits));
+    let peer = request
+        .peer_addr()
+        .map_or_else(|| "unknown".to_owned(), |address| address.ip().to_string());
+    let now = std::time::Instant::now();
+    if let Some(wait) = limits
+        .as_ref()
+        .and_then(|limits| limits.auth_failures.exhausted(&peer, now))
+    {
+        crate::metrics::METRICS.rate_limited();
+        return Err(Problem::too_many_requests(wait));
+    }
+    let failed = |problem: Problem| {
+        crate::metrics::METRICS.auth_failure();
+        if let Some(limits) = &limits {
+            let _ = limits.auth_failures.spend(&peer, now);
+        }
+        problem
+    };
+    let token = bearer_token(request.request()).map_err(failed)?;
     let authenticator = request
         .app_data::<SharedAuthenticator>()
         .cloned()
         .ok_or_else(|| rejection(AuthError::NotConfigured))?;
-    authenticator.authenticate(&token).await.map_err(rejection)
+    let caller = match authenticator.authenticate(&token).await {
+        Ok(caller) => caller,
+        Err(AuthError::Unavailable) => return Err(rejection(AuthError::Unavailable)),
+        Err(error) => return Err(failed(rejection(error))),
+    };
+    if let Some(limits) = &limits
+        && let Err(wait) = limits.requests.spend(caller.principal.as_str(), now)
+    {
+        crate::metrics::METRICS.rate_limited();
+        return Err(Problem::too_many_requests(wait));
+    }
+    Ok(caller)
 }
 
 fn bearer_token(request: &HttpRequest) -> Result<String, Problem> {
@@ -213,7 +404,7 @@ fn valid_token(token: &str) -> bool {
 fn rejection(error: AuthError) -> Problem {
     match error {
         AuthError::Unavailable => Problem::service_unavailable(error.to_string()),
-        AuthError::NotConfigured | AuthError::InvalidToken => {
+        AuthError::NotConfigured | AuthError::InvalidToken | AuthError::NotRegistered => {
             Problem::unauthorized(error.to_string(), CHALLENGE_INVALID_TOKEN)
         }
     }

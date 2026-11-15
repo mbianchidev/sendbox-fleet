@@ -192,6 +192,7 @@ pub async fn append(tx: &mut Tx, now_unix: u64, record: AuditRecord) -> Result<u
         ],
     )
     .await?;
+    crate::metrics::METRICS.audit_appended(sequence);
     Ok(sequence)
 }
 

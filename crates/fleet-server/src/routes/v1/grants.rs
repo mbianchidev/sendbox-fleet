@@ -3,7 +3,7 @@
 //! material; the provider credential stays in the SendBox host broker.
 
 use actix_web::{HttpResponse, web};
-use sendbox_governance::api::RevokeGrantRequest;
+use sendbox_governance::api::{ReportedOutcome, RequestOutcomeReport, RevokeGrantRequest};
 use sendbox_governance::grant::{validate_method, validate_path_prefix};
 use sendbox_governance::{
     CONTRACT_VERSION, CredentialGrant, DenyReason, GrantId, GrantRequest, RevocationReason,
@@ -11,7 +11,7 @@ use sendbox_governance::{
 };
 
 use super::{State, actor, invalid, refuse};
-use crate::audit::{self, AuditDecision, AuditRecord};
+use crate::audit::{self, AuditDecision, AuditOutcome, AuditRecord};
 use crate::auth::{Authenticated, Caller};
 use crate::db::Tx;
 use crate::governance::{self, ProjectRole, SessionStatus, StoredGrant};
@@ -26,7 +26,8 @@ pub fn configure(config: &mut web::ServiceConfig) {
     config
         .service(resource("/grants").route(web::post().to(issue)))
         .service(resource("/grants/{grant_id:[^/:]+}:renew").route(web::post().to(renew)))
-        .service(resource("/grants/{grant_id:[^/:]+}:revoke").route(web::post().to(revoke)));
+        .service(resource("/grants/{grant_id:[^/:]+}:revoke").route(web::post().to(revoke)))
+        .service(resource("/grants/{grant_id:[^/:]+}:outcome").route(web::post().to(outcome)));
 }
 
 fn base(caller: &Caller, grant: &CredentialGrant) -> AuditRecord {
@@ -418,6 +419,64 @@ async fn revoke(
         AuditRecord {
             event_type: "grant.revoked",
             detail: Some(format!("reason={}", reason.code())),
+            ..base(&caller, &stored.grant)
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// Records how one brokered stream ended, as reported by the grant's host.
+/// Outcomes are evidence only: they never change a grant or a decision.
+async fn outcome(
+    state: State,
+    Authenticated(caller): Authenticated,
+    grant_id: web::Path<GrantId>,
+    report: web::Json<RequestOutcomeReport>,
+) -> Result<HttpResponse, Problem> {
+    let grant_id = grant_id.into_inner();
+    let report = report.into_inner();
+    report.validate().map_err(invalid)?;
+    let now = state.now();
+    let mut tx = state.database.begin_write().await?;
+    let stored = governance::grant(&mut tx, &grant_id)
+        .await?
+        .ok_or_else(|| Problem::missing(format!("grant `{grant_id}` does not exist")))?;
+    if stored.grant.principal != caller.principal {
+        return Err(Problem::forbidden(
+            "only the grant's principal can report its outcomes",
+        ));
+    }
+    if report.service != stored.grant.service {
+        return Err(Problem::bad_request("the report names another service"));
+    }
+    let path = if sendbox_governance::validate_request_path(&report.path).is_ok() {
+        report.path.chars().take(400).collect::<String>()
+    } else {
+        "<invalid path>".to_owned()
+    };
+    audit::append(
+        &mut tx,
+        now,
+        AuditRecord {
+            event_type: "request.outcome",
+            outcome: Some(match report.outcome {
+                ReportedOutcome::Succeeded => AuditOutcome::Succeeded,
+                ReportedOutcome::Failed => AuditOutcome::Failed,
+                ReportedOutcome::Unknown => AuditOutcome::Unknown,
+            }),
+            target: Some(format!("{} {}{path}", report.method, report.service)),
+            detail: Some(format!(
+                "reason={} status={} request_bytes={} response_bytes={} duration_ms={}",
+                report.reason,
+                report
+                    .status
+                    .map_or_else(|| "none".to_owned(), |status| status.to_string()),
+                report.request_bytes,
+                report.response_bytes,
+                report.duration_ms
+            )),
             ..base(&caller, &stored.grant)
         },
     )

@@ -37,10 +37,24 @@ services:
       FLEET_AUTHORITY_ID: ${FLEET_AUTHORITY_ID:-sendbox-fleet}
       # Container path of the profile signer file, mounted by a compose override.
       FLEET_PROFILE_TRUST: ${FLEET_PROFILE_TRUST:-}
+      # Container path of the OIDC issuer file; empty disables identity-provider sign-in.
+      FLEET_OIDC_CONFIG: ${FLEET_OIDC_CONFIG:-}
+      FLEET_TOKEN_TTL_SECONDS: ${FLEET_TOKEN_TTL_SECONDS:-43200}
+      FLEET_TOKEN_MAX_TTL_SECONDS: ${FLEET_TOKEN_MAX_TTL_SECONDS:-604800}
+      # Container path of the audit-head signing key; empty disables signed heads.
+      FLEET_AUDIT_SIGNING_KEY: ${FLEET_AUDIT_SIGNING_KEY:-}
+      FLEET_AUDIT_ANCHOR_DIR: ${FLEET_AUDIT_ANCHOR_DIR:-}
+      FLEET_AUDIT_ANCHOR_INTERVAL_SECONDS: ${FLEET_AUDIT_ANCHOR_INTERVAL_SECONDS:-3600}
+      FLEET_RATE_LIMIT_PER_MINUTE: ${FLEET_RATE_LIMIT_PER_MINUTE:-1200}
+      FLEET_AUTH_FAILURES_PER_MINUTE: ${FLEET_AUTH_FAILURES_PER_MINUTE:-60}
+      FLEET_METRICS_BIND: ${FLEET_METRICS_BIND:-}
+      FLEET_MIGRATE: ${FLEET_MIGRATE:-true}
+      FLEET_LOG_MAX_BYTES: ${FLEET_LOG_MAX_BYTES:-104857600}
     ports:
       - "127.0.0.1:${FLEET_PORT:-8080}:8080"
     volumes:
       - fleet-logs:/var/log/sendbox-fleet
+      - fleet-anchors:/var/lib/sendbox-fleet/anchors
     read_only: true
     cap_drop:
       - ALL
@@ -52,6 +66,7 @@ services:
 volumes:
   postgres-data:
   fleet-logs:
+  fleet-anchors:
 
 networks:
   backend:

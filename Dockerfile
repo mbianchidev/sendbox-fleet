@@ -12,10 +12,15 @@ RUN cargo build --locked --release --bin sendbox-fleet \
     && install -D -m 0755 target/release/sendbox-fleet /out/sendbox-fleet
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
-RUN groupadd --system --gid 10001 fleet \
+# CA certificates verify identity-provider discovery and JWKS over HTTPS.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 fleet \
     && useradd --system --uid 10001 --gid fleet --no-create-home \
         --home-dir /var/lib/sendbox-fleet --shell /usr/sbin/nologin fleet \
-    && install -d -o fleet -g fleet -m 0700 /var/lib/sendbox-fleet /var/log/sendbox-fleet
+    && install -d -o fleet -g fleet -m 0700 /var/lib/sendbox-fleet /var/log/sendbox-fleet \
+        /var/lib/sendbox-fleet/anchors
 COPY --from=build /out/sendbox-fleet /usr/local/bin/sendbox-fleet
 USER 10001:10001
 WORKDIR /var/lib/sendbox-fleet

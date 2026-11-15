@@ -84,8 +84,14 @@ async fn authorize(
         }
     };
     let (decision_code, deny_reason) = match &decision {
-        Decision::Allow(_) => (AuditDecision::Allow, None),
-        Decision::Deny { reason } => (AuditDecision::Deny, Some(*reason)),
+        Decision::Allow(_) => {
+            crate::metrics::METRICS.decision("allow", "none");
+            (AuditDecision::Allow, None)
+        }
+        Decision::Deny { reason } => {
+            crate::metrics::METRICS.decision("deny", reason.code());
+            (AuditDecision::Deny, Some(*reason))
+        }
     };
     let grant = stored.as_ref().map(|stored| &stored.grant);
     audit::append(

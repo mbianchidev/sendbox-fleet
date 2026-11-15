@@ -1,6 +1,8 @@
 //! HTTP behaviour of the shared governance service: authentication before
 //! validation, project roles, signed profiles, session admission, grants,
-//! authorization, exceptions, and the audit chain. All data is synthetic.
+//! authorization, exceptions, the audit chain, identity-provider sign-in,
+//! token exchange, signed audit heads, and rate limits. All data and keys are
+//! synthetic.
 //!
 //! Runs against in-memory SQLite by default. Set `FLEET_TEST_DATABASE_URL` to
 //! a PostgreSQL database whose name ends in `_test` to run the same requests
@@ -9,17 +11,28 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use actix_web::body::MessageBody;
 use actix_web::dev::{Service, ServiceResponse};
 use actix_web::http::{Method, StatusCode, header};
-use actix_web::{test, web};
-use fleet_server::auth::{self, DatabaseAuthenticator, token_from_bytes};
-use fleet_server::config::DatabaseUrl;
+use actix_web::{App, HttpResponse, HttpServer, test, web};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use fleet_server::anchor::{self, AuditSigner};
+use fleet_server::auth::{self, FleetAuthenticator, token_from_bytes};
+use fleet_server::config::{DatabaseUrl, TokenLimits};
 use fleet_server::db::{Arg, Database};
+use fleet_server::oidc::{OidcConfig, OidcVerifier};
+use fleet_server::ratelimit::{Limits, RateLimiter};
 use fleet_server::server;
 use fleet_server::state::AppState;
+use ring::rand::SystemRandom;
+use ring::signature::{
+    ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair, KeyPair as _,
+};
 use sendbox_governance::{
     AuthorityRef, CONTRACT_VERSION, Clock, ExceptionId, GovernanceBinding, PrincipalId, ProfileRef,
     ProjectId, ServiceId, SessionRef, Sha256Digest,
@@ -114,9 +127,31 @@ struct Fleet<S> {
     clock: Arc<TestClock>,
     key: SigningKeyMaterial,
     tokens: HashMap<&'static str, String>,
+    audit_signer: Option<Arc<AuditSigner>>,
+}
+
+/// Optional features; everything is off by default.
+#[derive(Default)]
+struct Setup {
+    oidc: Option<OidcConfig>,
+    audit_signer: Option<Arc<AuditSigner>>,
+    /// Per-principal requests and per-peer failures per minute.
+    limits: (u32, u32),
 }
 
 async fn fleet() -> Fleet<
+    impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<impl MessageBody>,
+        Error = actix_web::Error,
+    >,
+> {
+    fleet_with(Setup::default()).await
+}
+
+async fn fleet_with(
+    setup: Setup,
+) -> Fleet<
     impl Service<
         actix_http::Request,
         Response = ServiceResponse<impl MessageBody>,
@@ -200,10 +235,22 @@ async fn fleet() -> Fleet<
         random: Arc::new(fleet_server::state::os_random),
         authority_id: AUTHORITY.to_owned(),
         profile_trust: Some(trust),
+        tokens: TokenLimits::default(),
+        audit_signer: setup.audit_signer.clone(),
+        limits: Arc::new(Limits {
+            requests: RateLimiter::new(setup.limits.0),
+            auth_failures: RateLimiter::new(setup.limits.1),
+        }),
     });
-    let authenticator = auth::shared(Arc::new(DatabaseAuthenticator::new(
+    let oidc = setup.oidc.map(|config| {
+        OidcVerifier::new(config, clock.clone())
+            .unwrap()
+            .with_min_refresh_interval(Duration::ZERO)
+    });
+    let authenticator = auth::shared(Arc::new(FleetAuthenticator::new(
         database.clone(),
         clock.clone(),
+        oidc,
     )));
     let service = test::init_service(server::app(state, authenticator)).await;
     Fleet {
@@ -212,6 +259,7 @@ async fn fleet() -> Fleet<
         clock,
         key,
         tokens,
+        audit_signer: setup.audit_signer,
     }
 }
 
@@ -227,7 +275,23 @@ where
         token: Option<&str>,
         body: Option<&Value>,
     ) -> (StatusCode, Value) {
+        let (status, _, value) = self.respond(None, method, path, token, body).await;
+        (status, value)
+    }
+
+    /// Sends a request from `peer` and returns the headers as well.
+    async fn respond(
+        &self,
+        peer: Option<&str>,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&Value>,
+    ) -> (StatusCode, header::HeaderMap, Value) {
         let mut request = test::TestRequest::default().method(method).uri(path);
+        if let Some(peer) = peer {
+            request = request.peer_addr(peer.parse().unwrap());
+        }
         if let Some(token) = token {
             request = request.insert_header((header::AUTHORIZATION, format!("Bearer {token}")));
         }
@@ -237,6 +301,7 @@ where
         };
         let response = test::call_service(&self.service, request).await;
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = test::read_body(response).await;
         let value = if bytes.is_empty() {
             Value::Null
@@ -251,7 +316,7 @@ where
                     .is_some_and(|detail| !detail.is_empty())
             );
         }
-        (status, value)
+        (status, headers, value)
     }
 
     async fn call(
@@ -1284,4 +1349,896 @@ async fn invalid_contract_bodies_and_transport_errors_are_problems() {
         .to_request();
     let response = test::call_service(&fleet.service, request).await;
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+/// A synthetic identity-provider signing key.
+enum IdpKey {
+    Ed25519 {
+        kid: &'static str,
+        pair: Ed25519KeyPair,
+    },
+    Es256 {
+        kid: &'static str,
+        pair: EcdsaKeyPair,
+    },
+}
+
+impl IdpKey {
+    fn ed25519(kid: &'static str) -> Self {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        Self::Ed25519 {
+            kid,
+            pair: Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap(),
+        }
+    }
+
+    fn es256(kid: &'static str) -> Self {
+        let random = SystemRandom::new();
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &random).unwrap();
+        Self::Es256 {
+            kid,
+            pair: EcdsaKeyPair::from_pkcs8(
+                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                pkcs8.as_ref(),
+                &random,
+            )
+            .unwrap(),
+        }
+    }
+
+    fn jwk(&self) -> Value {
+        match self {
+            Self::Ed25519 { kid, pair } => json!({
+                "kty": "OKP", "crv": "Ed25519", "use": "sig", "alg": "EdDSA", "kid": kid,
+                "x": URL_SAFE_NO_PAD.encode(pair.public_key().as_ref()),
+            }),
+            Self::Es256 { kid, pair } => {
+                let point = pair.public_key().as_ref();
+                json!({
+                    "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256", "kid": kid,
+                    "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
+                    "y": URL_SAFE_NO_PAD.encode(&point[33..65]),
+                })
+            }
+        }
+    }
+
+    fn sign(&self, claims: &Value) -> String {
+        let (algorithm, kid) = match self {
+            Self::Ed25519 { kid, .. } => ("EdDSA", kid),
+            Self::Es256 { kid, .. } => ("ES256", kid),
+        };
+        let encode = |value: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap());
+        let message = format!(
+            "{}.{}",
+            encode(&json!({ "alg": algorithm, "kid": kid, "typ": "JWT" })),
+            encode(claims)
+        );
+        let signature = match self {
+            Self::Ed25519 { pair, .. } => pair.sign(message.as_bytes()).as_ref().to_vec(),
+            Self::Es256 { pair, .. } => pair
+                .sign(&SystemRandom::new(), message.as_bytes())
+                .unwrap()
+                .as_ref()
+                .to_vec(),
+        };
+        format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+}
+
+/// Key sets served by the local identity provider; `None` answers `500`.
+struct IdpState {
+    base: String,
+    users: Mutex<Option<Value>>,
+    ci: Mutex<Option<Value>>,
+}
+
+async fn discovery(state: web::Data<IdpState>) -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "issuer": format!("{}/users", state.base),
+        "jwks_uri": format!("{}/users/jwks", state.base),
+    }))
+}
+
+fn key_set(keys: &Mutex<Option<Value>>) -> HttpResponse {
+    match keys.lock().unwrap().clone() {
+        Some(keys) => HttpResponse::Ok().json(keys),
+        None => HttpResponse::InternalServerError().finish(),
+    }
+}
+
+async fn users_jwks(state: web::Data<IdpState>) -> HttpResponse {
+    key_set(&state.users)
+}
+
+async fn ci_jwks(state: web::Data<IdpState>) -> HttpResponse {
+    key_set(&state.ci)
+}
+
+/// A loopback identity provider: `/users` uses discovery, `/ci` a fixed
+/// JWKS URI.
+async fn identity_provider(users: &[&IdpKey], ci: &[&IdpKey]) -> web::Data<IdpState> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let keys =
+        |keys: &[&IdpKey]| json!({ "keys": keys.iter().map(|key| key.jwk()).collect::<Vec<_>>() });
+    let state = web::Data::new(IdpState {
+        base: format!("http://{}", listener.local_addr().unwrap()),
+        users: Mutex::new(Some(keys(users))),
+        ci: Mutex::new(Some(keys(ci))),
+    });
+    let shared = state.clone();
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(shared.clone())
+            .route(
+                "/users/.well-known/openid-configuration",
+                web::get().to(discovery),
+            )
+            .route("/users/jwks", web::get().to(users_jwks))
+            .route("/ci/jwks", web::get().to(ci_jwks))
+    })
+    .workers(1)
+    .listen(listener)
+    .unwrap()
+    .run();
+    actix_web::rt::spawn(server);
+    state
+}
+
+fn oidc_config(base: &str) -> OidcConfig {
+    serde_json::from_value(json!({ "issuers": [
+        {
+            "issuer": format!("{base}/users"),
+            "audiences": ["sendbox-fleet"],
+            "kind": "user",
+            "principal_claim": "email",
+            "principal_prefix": "oidc",
+        },
+        {
+            "issuer": format!("{base}/ci"),
+            "audiences": ["sendbox-fleet"],
+            "kind": "worker",
+            "principal_claim": "repository_id",
+            "principal_prefix": "ci",
+            "auto_provision": true,
+            "jwks_uri": format!("{base}/ci/jwks"),
+            "algorithms": ["ES256"],
+            "required_claims": { "repository_owner": "example" },
+        },
+    ]}))
+    .unwrap()
+}
+
+fn person(base: &str, email: &str, now: u64) -> Value {
+    json!({
+        "iss": format!("{base}/users"),
+        "aud": "sendbox-fleet",
+        "sub": "synthetic-subject",
+        "email": email,
+        "email_verified": true,
+        "iat": now,
+        "exp": now + 300,
+    })
+}
+
+fn pipeline(base: &str, repository_id: u64, now: u64) -> Value {
+    json!({
+        "iss": format!("{base}/ci"),
+        "aud": ["other", "sendbox-fleet"],
+        "repository_id": repository_id,
+        "repository_owner": "example",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 300,
+    })
+}
+
+impl<S, B> Fleet<S>
+where
+    S: Service<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
+    async fn sign_in(&self, token: &str) -> StatusCode {
+        self.send(Method::GET, "/v1/tokens", Some(token), None)
+            .await
+            .0
+    }
+
+    async fn exchange(&self, token: &str, body: Value) -> (StatusCode, header::HeaderMap, Value) {
+        self.respond(None, Method::POST, "/v1/tokens", Some(token), Some(&body))
+            .await
+    }
+}
+
+#[actix_web::test]
+async fn identity_provider_tokens_need_a_trusted_signature_and_exact_claims() {
+    let user_key = IdpKey::ed25519("user-1");
+    let ci_key = IdpKey::es256("ci-1");
+    let idp = identity_provider(&[&user_key], &[&ci_key]).await;
+    let base = idp.base.as_str();
+    let fleet = fleet_with(Setup {
+        oidc: Some(oidc_config(base)),
+        ..Setup::default()
+    })
+    .await;
+    let now = fleet.now();
+    let alice = person(base, "alice@example.com", now);
+    assert_eq!(fleet.sign_in(&user_key.sign(&alice)).await, StatusCode::OK);
+
+    let mut tampered = user_key.sign(&alice);
+    let forged = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&person(base, "olivia@example.com", now)).unwrap());
+    let parts = tampered.split('.').map(str::to_owned).collect::<Vec<_>>();
+    tampered = format!("{}.{forged}.{}", parts[0], parts[2]);
+    let unsigned = |algorithm: &str, signature: &str| {
+        let encode = |value: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap());
+        format!(
+            "{}.{}.{signature}",
+            encode(&json!({ "alg": algorithm, "kid": "user-1" })),
+            encode(&alice)
+        )
+    };
+    let impostor = IdpKey::ed25519("user-1");
+    let unpublished = IdpKey::ed25519("user-9");
+    let with = |change: &dyn Fn(&mut Value)| {
+        let mut claims = alice.clone();
+        change(&mut claims);
+        user_key.sign(&claims)
+    };
+    for (case, token) in [
+        ("tampered payload", tampered),
+        ("alg none", unsigned("none", "")),
+        ("HMAC", unsigned("HS256", "c2lnbmF0dXJl")),
+        ("same kid, other key", impostor.sign(&alice)),
+        ("unpublished key", unpublished.sign(&alice)),
+        (
+            "expired",
+            with(&|claims| {
+                claims["iat"] = json!(now - 600);
+                claims["exp"] = json!(now - 61);
+            }),
+        ),
+        (
+            "not yet valid",
+            with(&|claims| claims["nbf"] = json!(now + 120)),
+        ),
+        (
+            "issued in the future",
+            with(&|claims| claims["iat"] = json!(now + 120)),
+        ),
+        (
+            "wrong audience",
+            with(&|claims| claims["aud"] = json!("other")),
+        ),
+        (
+            "unknown issuer",
+            with(&|claims| claims["iss"] = json!(format!("{base}/elsewhere"))),
+        ),
+        (
+            "unverified email",
+            with(&|claims| claims["email_verified"] = json!(false)),
+        ),
+        (
+            "no email_verified",
+            with(&|claims| {
+                claims.as_object_mut().unwrap().remove("email_verified");
+            }),
+        ),
+        (
+            "no expiry",
+            with(&|claims| {
+                claims.as_object_mut().unwrap().remove("exp");
+            }),
+        ),
+        (
+            "unregistered",
+            user_key.sign(&person(base, "nobody@example.com", now)),
+        ),
+        (
+            "not a principal id",
+            user_key.sign(&person(base, "a b@example.com", now)),
+        ),
+        ("ci key on the user issuer", ci_key.sign(&alice)),
+        (
+            "wrong owner claim",
+            ci_key.sign(&{
+                let mut claims = pipeline(base, 4242, now);
+                claims["repository_owner"] = json!("someone-else");
+                claims
+            }),
+        ),
+        (
+            "algorithm not allowed",
+            IdpKey::ed25519("ci-1").sign(&pipeline(base, 4242, now)),
+        ),
+    ] {
+        assert_eq!(
+            fleet.sign_in(&token).await,
+            StatusCode::UNAUTHORIZED,
+            "{case}"
+        );
+    }
+
+    let mut tx = fleet.database.begin_write().await.unwrap();
+    tx.execute(
+        "UPDATE principals SET disabled_at_unix = $2 WHERE id = $1",
+        &[BOB.into(), Arg::from(i64::try_from(now).unwrap())],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO principals (id, kind, created_at_unix) VALUES ('ci:777', 'user', 0)",
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let bob = user_key.sign(&person(base, "bob@example.com", now));
+    assert_eq!(
+        fleet.sign_in(&bob).await,
+        StatusCode::UNAUTHORIZED,
+        "disabled"
+    );
+    let mismatched = ci_key.sign(&pipeline(base, 777, now));
+    assert_eq!(
+        fleet.sign_in(&mismatched).await,
+        StatusCode::UNAUTHORIZED,
+        "a worker issuer cannot sign in as a user"
+    );
+
+    let ci = ci_key.sign(&pipeline(base, 4242, now));
+    assert_eq!(fleet.sign_in(&ci).await, StatusCode::OK, "auto-provisioned");
+    assert_eq!(fleet.sign_in(&ci).await, StatusCode::OK);
+    let provisioned = fleet
+        .events("principal=ci:4242")
+        .await
+        .into_iter()
+        .filter(|event| event["event_type"] == "principal.provisioned")
+        .collect::<Vec<_>>();
+    assert_eq!(provisioned.len(), 1);
+    assert_eq!(
+        provisioned[0]["detail"],
+        format!("kind=worker issuer={base}/ci")
+    );
+    let row = fleet
+        .database
+        .fetch_optional(
+            "SELECT kind, is_operator AS operator FROM principals WHERE id = 'ci:4242'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.text("kind").unwrap(), "worker");
+    assert!(
+        !row.flag("operator").unwrap(),
+        "provisioned principals hold no roles"
+    );
+    let (status, _) = fleet
+        .send(
+            Method::POST,
+            "/v1/projects",
+            Some(&ci),
+            Some(&json!({ "project": "github:example/other", "owner": "ci:4242" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[actix_web::test]
+async fn identity_provider_keys_rotate_and_outages_fail_closed() {
+    let first = IdpKey::ed25519("user-1");
+    let second = IdpKey::es256("user-2");
+    let ci_key = IdpKey::es256("ci-1");
+    let idp = identity_provider(&[&first], &[&ci_key]).await;
+    let base = idp.base.clone();
+    let fleet = fleet_with(Setup {
+        oidc: Some(oidc_config(&base)),
+        ..Setup::default()
+    })
+    .await;
+    let alice = person(&base, "alice@example.com", fleet.now());
+    assert_eq!(fleet.sign_in(&first.sign(&alice)).await, StatusCode::OK);
+
+    *idp.users.lock().unwrap() = Some(json!({ "keys": [second.jwk()] }));
+    assert_eq!(
+        fleet.sign_in(&second.sign(&alice)).await,
+        StatusCode::OK,
+        "an unknown key id refreshes the key set"
+    );
+    assert_eq!(
+        fleet.sign_in(&first.sign(&alice)).await,
+        StatusCode::UNAUTHORIZED,
+        "retired keys stop working once the key set is refreshed"
+    );
+
+    *idp.users.lock().unwrap() = None;
+    assert_eq!(
+        fleet.sign_in(&second.sign(&alice)).await,
+        StatusCode::OK,
+        "cached keys survive a provider outage"
+    );
+    assert_eq!(
+        fleet.sign_in(&IdpKey::ed25519("user-3").sign(&alice)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    *idp.ci.lock().unwrap() = None;
+    let (status, body) = fleet
+        .send(
+            Method::GET,
+            "/v1/tokens",
+            Some(&ci_key.sign(&pipeline(&base, 4242, fleet.now()))),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let (status, _) = fleet
+        .send(Method::GET, "/v1/tokens", Some(&first.sign(&alice)), None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let plain = fleet_with(Setup::default()).await;
+    assert_eq!(
+        plain.sign_in(&second.sign(&alice)).await,
+        StatusCode::UNAUTHORIZED,
+        "identity-provider tokens need FLEET_OIDC_CONFIG"
+    );
+}
+
+#[actix_web::test]
+async fn sign_in_exchanges_for_short_lived_service_tokens() {
+    let key = IdpKey::ed25519("user-1");
+    let idp = identity_provider(&[&key], &[]).await;
+    let fleet = fleet_with(Setup {
+        oidc: Some(oidc_config(&idp.base)),
+        ..Setup::default()
+    })
+    .await;
+    let now = fleet.now();
+    let alice = key.sign(&person(&idp.base, "alice@example.com", now));
+
+    let (status, headers, issued) = fleet
+        .exchange(
+            &alice,
+            json!({ "ttl_seconds": 3_600, "description": "Synthetic laptop" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(issued["principal"], MEMBER);
+    assert_eq!(issued["expires_at_unix"], now + 3_600);
+    let token = issued["token"].as_str().unwrap().to_owned();
+    let id = issued["id"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("sbf_"));
+    assert_eq!(id.len(), 32);
+
+    let (_, _, default) = fleet.exchange(&alice, json!({})).await;
+    assert_eq!(
+        default["expires_at_unix"],
+        now + TokenLimits::default().default_seconds
+    );
+    let max = TokenLimits::default().max_seconds;
+    for body in [
+        json!({ "ttl_seconds": 59 }),
+        json!({ "ttl_seconds": max + 1 }),
+        json!({ "description": "\u{0007}" }),
+        json!({ "description": " " }),
+    ] {
+        assert_eq!(
+            fleet.exchange(&alice, body.clone()).await.0,
+            StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    for service_token in [token.as_str(), fleet.tokens[MEMBER].as_str()] {
+        assert_eq!(
+            fleet.exchange(service_token, json!({})).await.0,
+            StatusCode::FORBIDDEN,
+            "a service token cannot mint another"
+        );
+    }
+
+    let (status, list) = fleet
+        .send(Method::GET, "/v1/tokens", Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let tokens = list["tokens"].as_array().unwrap();
+    assert_eq!(tokens.len(), 3, "the seeded token and two exchanged tokens");
+    let summary = tokens.iter().find(|summary| summary["id"] == id).unwrap();
+    assert_eq!(summary["description"], "Synthetic laptop");
+    assert!(!list.to_string().contains("sbf_"));
+
+    let revoke = format!("/v1/tokens/{id}");
+    assert_eq!(
+        fleet.call(BOB, Method::DELETE, &revoke, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        fleet
+            .call(BOB, Method::DELETE, "/v1/tokens/not-hex", None)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, _) = fleet
+        .send(Method::DELETE, &revoke, Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = fleet
+        .send(Method::DELETE, &revoke, Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "revocation is idempotent");
+    assert_eq!(fleet.sign_in(&token).await, StatusCode::UNAUTHORIZED);
+    let other = default["token"].as_str().unwrap();
+    assert_eq!(fleet.sign_in(other).await, StatusCode::OK);
+    let (status, _) = fleet
+        .call(
+            OPERATOR,
+            Method::DELETE,
+            &format!("/v1/tokens/{}", default["id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "operators may revoke any token"
+    );
+    assert_eq!(fleet.sign_in(other).await, StatusCode::UNAUTHORIZED);
+
+    let (_, _, short) = fleet.exchange(&alice, json!({ "ttl_seconds": 60 })).await;
+    fleet.advance(61);
+    assert_eq!(
+        fleet.sign_in(short["token"].as_str().unwrap()).await,
+        StatusCode::UNAUTHORIZED,
+        "exchanged tokens expire"
+    );
+
+    let mut issued_tokens = Vec::new();
+    let conflict = loop {
+        let (status, _, body) = fleet.exchange(&alice, json!({ "ttl_seconds": 600 })).await;
+        if status != StatusCode::CREATED {
+            break status;
+        }
+        issued_tokens.push(body["token"].as_str().unwrap().to_owned());
+        assert!(issued_tokens.len() <= 20);
+    };
+    assert_eq!(conflict, StatusCode::CONFLICT);
+    assert_eq!(
+        issued_tokens.len(),
+        19,
+        "20 live tokens including the seeded one"
+    );
+
+    let events = fleet
+        .events("principal=oidc:alice@example.com&limit=500")
+        .await;
+    let count = |kind: &str| {
+        events
+            .iter()
+            .filter(|event| event["event_type"] == kind)
+            .count()
+    };
+    assert_eq!(count("token.issued"), 22);
+    assert_eq!(count("token.revoked"), 2);
+    let serialized = serde_json::to_string(&events).unwrap();
+    for secret in issued_tokens.iter().chain([&token]) {
+        assert!(!serialized.contains(secret.as_str()));
+    }
+}
+
+#[actix_web::test]
+async fn outcome_reports_are_attributed_evidence_that_never_change_decisions() {
+    let fleet = fleet().await;
+    let profile = fleet.project().await;
+    let plain = binding(MEMBER, &profile, vec![]);
+    let id = session('c');
+    assert_eq!(fleet.admit(MEMBER, &plain, &id).await.0, StatusCode::OK);
+    let (_, grant) = fleet
+        .call(
+            MEMBER,
+            Method::POST,
+            "/v1/grants",
+            Some(grant_request(&plain, &id)),
+        )
+        .await;
+    let path = format!("/v1/grants/{}:outcome", grant["grant_id"].as_str().unwrap());
+    let report = json!({
+        "service": "anthropic",
+        "method": "POST",
+        "path": "/v1/messages",
+        "outcome": "failed",
+        "reason": "upstream_error",
+        "status": 502,
+        "request_bytes": 10,
+        "response_bytes": 20,
+        "duration_ms": 30,
+    });
+    let changed = |field: &str, value: Value| {
+        let mut report = report.clone();
+        report[field] = value;
+        Some(report)
+    };
+    assert_eq!(
+        fleet
+            .call(BOB, Method::POST, &path, Some(report.clone()))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    for (field, value, expected) in [
+        ("service", json!("openai"), StatusCode::BAD_REQUEST),
+        ("reason", json!("Not A Code"), StatusCode::BAD_REQUEST),
+        ("method", json!("post"), StatusCode::BAD_REQUEST),
+        ("status", json!(42), StatusCode::BAD_REQUEST),
+        ("headers", json!({}), StatusCode::BAD_REQUEST),
+    ] {
+        let (status, body) = fleet
+            .call(MEMBER, Method::POST, &path, changed(field, value))
+            .await;
+        assert_eq!(status, expected, "{field}: {body}");
+    }
+    let missing = format!("/v1/grants/{}:outcome", "f".repeat(32));
+    assert_eq!(
+        fleet
+            .call(MEMBER, Method::POST, &missing, Some(report.clone()))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        fleet
+            .call(MEMBER, Method::POST, &path, Some(report))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, body) = fleet
+        .call(
+            MEMBER,
+            Method::POST,
+            "/v1/authorize",
+            Some(context(&grant, "/v1/messages")),
+        )
+        .await;
+    assert_eq!(decision(&body), "allow", "outcomes are evidence only");
+
+    let events = fleet.events(&format!("session={id}")).await;
+    let outcome = events
+        .iter()
+        .find(|event| event["event_type"] == "request.outcome")
+        .unwrap();
+    assert_eq!(outcome["outcome"], "failed");
+    assert_eq!(outcome["actor"], MEMBER);
+    assert_eq!(outcome["target"], "POST anthropic/v1/messages");
+    assert_eq!(
+        outcome["detail"],
+        "reason=upstream_error status=502 request_bytes=10 response_bytes=20 duration_ms=30"
+    );
+}
+
+#[actix_web::test]
+async fn signed_audit_heads_anchor_the_chain_and_reveal_rewrites() {
+    {
+        let unsigned = fleet().await;
+        let (status, _) = unsigned
+            .call(OPERATOR, Method::GET, "/v1/audit/head", None)
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let signer = Arc::new(AuditSigner::from_key(
+        SigningKeyMaterial::generate().unwrap(),
+    ));
+    let fleet = fleet_with(Setup {
+        audit_signer: Some(signer.clone()),
+        ..Setup::default()
+    })
+    .await;
+    assert!(fleet.audit_signer.is_some());
+    fleet.project().await;
+    assert_eq!(
+        fleet
+            .call(OWNER, Method::GET, "/v1/audit/head", None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, head) = fleet
+        .call(OPERATOR, Method::GET, "/v1/audit/head", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{head}");
+    let last = fleet.events("limit=500").await.last().unwrap().clone();
+    assert_eq!(head["head"]["sequence"], last["sequence"]);
+    assert_eq!(head["head"]["event_hash"], last["event_hash"]);
+    assert_eq!(head["head"]["authority_id"], AUTHORITY);
+
+    let directory = tempfile::tempdir().unwrap();
+    let signed: anchor::SignedAuditHead = serde_json::from_value(head.clone()).unwrap();
+    let path = anchor::write_anchor(directory.path(), &signed)
+        .unwrap()
+        .unwrap();
+    assert!(
+        anchor::write_anchor(directory.path(), &signed)
+            .unwrap()
+            .is_none(),
+        "anchors are never overwritten"
+    );
+    let check = |file: std::path::PathBuf| {
+        let database = fleet.database.clone();
+        let identity = signer.identity.clone();
+        async move {
+            anchor::check_anchor(&database, &identity, &file)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(check(path.clone()).await.valid);
+
+    fleet.approved_exception(&fleet.publish(4).await).await;
+    assert!(
+        check(path.clone()).await.valid,
+        "a growing chain keeps old anchors valid"
+    );
+
+    let other = AuditSigner::from_key(SigningKeyMaterial::generate().unwrap());
+    let foreign = directory.path().join("foreign.json");
+    std::fs::write(
+        &foreign,
+        serde_json::to_vec(&other.sign(signed.head.clone()).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(!check(foreign).await.valid, "another key's anchor");
+    let mut edited = head.clone();
+    edited["head"]["signed_at_unix"] = json!(NOW + 1);
+    let edited_path = directory.path().join("edited.json");
+    std::fs::write(&edited_path, serde_json::to_vec(&edited).unwrap()).unwrap();
+    assert!(!check(edited_path).await.valid, "an edited anchor");
+
+    let mut tx = fleet.database.begin_write().await.unwrap();
+    let drop_trigger = match fleet.database {
+        Database::Postgres(_) => "DROP TRIGGER audit_events_reject_update_delete ON audit_events",
+        Database::Sqlite(_) => "DROP TRIGGER audit_events_reject_update",
+    };
+    tx.execute(drop_trigger, &[]).await.unwrap();
+    tx.execute(
+        "UPDATE audit_events SET event_hash = $2 WHERE sequence = $1",
+        &[
+            Arg::from(i64::try_from(signed.head.sequence).unwrap()),
+            "0".repeat(64).into(),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let rewritten = check(path).await;
+    assert!(!rewritten.valid);
+    assert_eq!(
+        rewritten.reason.as_deref(),
+        Some("the database holds a different event at this sequence")
+    );
+    let (_, verification) = fleet
+        .call(OPERATOR, Method::GET, "/v1/audit/verify", None)
+        .await;
+    assert_eq!(verification["valid"], false);
+}
+
+#[actix_web::test]
+async fn rate_limits_refuse_with_retry_after() {
+    let fleet = fleet_with(Setup {
+        limits: (3, 2),
+        ..Setup::default()
+    })
+    .await;
+    let attacker = Some("192.0.2.1:40000");
+    for token in [Some("sbf_not-a-token"), None] {
+        let (status, _, _) = fleet
+            .respond(attacker, Method::GET, "/v1/tokens", token, None)
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, headers, _) = fleet
+        .respond(
+            attacker,
+            Method::GET,
+            "/v1/tokens",
+            Some(&fleet.tokens[MEMBER]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "even valid tokens wait"
+    );
+    assert_eq!(headers.get(header::RETRY_AFTER).unwrap(), "30");
+    let (status, _, _) = fleet
+        .respond(attacker, Method::GET, "/healthz", None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "probes are not limited");
+
+    let office = Some("192.0.2.2:40000");
+    for _ in 0..3 {
+        let (status, _, _) = fleet
+            .respond(
+                office,
+                Method::GET,
+                "/v1/tokens",
+                Some(&fleet.tokens[VIEWER]),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, headers, _) = fleet
+        .respond(
+            office,
+            Method::GET,
+            "/v1/tokens",
+            Some(&fleet.tokens[VIEWER]),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get(header::RETRY_AFTER).unwrap(), "20");
+    let (status, _, _) = fleet
+        .respond(
+            office,
+            Method::GET,
+            "/v1/tokens",
+            Some(&fleet.tokens[BOB]),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "limits are per principal");
+}
+
+#[actix_web::test]
+async fn metrics_are_served_only_on_their_own_listener() {
+    let fleet = fleet().await;
+    assert_eq!(
+        fleet.call(MEMBER, Method::GET, "/v1/tokens", None).await.0,
+        StatusCode::OK
+    );
+    let response = test::call_service(
+        &fleet.service,
+        test::TestRequest::get().uri("/metrics").to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let metrics = test::init_service(App::new().configure(fleet_server::metrics::configure)).await;
+    let response = test::call_service(
+        &metrics,
+        test::TestRequest::get().uri("/metrics").to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain; version=0.0.4")
+    );
+    let text = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+    let successes = text
+        .lines()
+        .find_map(|line| line.strip_prefix("fleet_http_requests_total{class=\"2xx\"} "))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(successes >= 1);
+    for name in [
+        "fleet_auth_failures_total",
+        "fleet_rate_limited_total",
+        "fleet_audit_events_total",
+        "fleet_audit_sequence",
+        "fleet_http_request_duration_seconds_sum",
+    ] {
+        assert!(text.contains(&format!("\n{name} ")), "{name}");
+    }
+    assert!(!text.contains("@example.com") && !text.contains("sbf_"));
 }

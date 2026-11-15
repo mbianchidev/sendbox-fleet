@@ -10,6 +10,7 @@ pub mod grants;
 pub mod profiles;
 pub mod projects;
 pub mod sessions;
+pub mod tokens;
 pub mod whoami;
 
 use actix_web::web;
@@ -25,6 +26,7 @@ use crate::state::AppState;
 pub fn configure(config: &mut web::ServiceConfig) {
     config
         .configure(whoami::configure)
+        .configure(tokens::configure)
         .configure(sessions::configure)
         .configure(grants::configure)
         .configure(authorize::configure)

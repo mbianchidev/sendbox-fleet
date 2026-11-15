@@ -34,6 +34,10 @@ pub enum DbError {
     Migrate(#[from] MigrateError),
     #[error("database query failed: {0}")]
     Query(#[from] sqlx::Error),
+    #[error(
+        "migrations {0} are not applied; run `sendbox-fleet admin migrate` with a schema-owner role"
+    )]
+    Pending(String),
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +123,46 @@ impl Database {
             Self::Sqlite(pool) => SQLITE_MIGRATIONS.run(pool).await?,
         }
         Ok(())
+    }
+
+    /// Fails unless every embedded migration has been applied successfully,
+    /// for deployments whose runtime role cannot change the schema.
+    pub async fn check_migrated(&self) -> Result<(), DbError> {
+        let migrator = match self {
+            Self::Postgres(_) => &POSTGRES_MIGRATIONS,
+            Self::Sqlite(_) => &SQLITE_MIGRATIONS,
+        };
+        let ledger = match self {
+            Self::Postgres(_) => {
+                "SELECT 1 AS present WHERE to_regclass('_sqlx_migrations') IS NOT NULL"
+            }
+            Self::Sqlite(_) => {
+                "SELECT 1 AS present FROM sqlite_master \
+                 WHERE type = 'table' AND name = '_sqlx_migrations'"
+            }
+        };
+        let applied = if self.fetch_optional(ledger, &[]).await?.is_some() {
+            self.fetch_all(
+                "SELECT version FROM _sqlx_migrations WHERE success = TRUE",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| row.int("version"))
+            .collect::<Result<std::collections::BTreeSet<i64>, _>>()?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let missing = migrator
+            .iter()
+            .filter(|migration| !applied.contains(&migration.version))
+            .map(|migration| migration.version.to_string())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Pending(missing.join(", ")))
+        }
     }
 
     /// Round-trips a trivial query; used by the readiness probe.

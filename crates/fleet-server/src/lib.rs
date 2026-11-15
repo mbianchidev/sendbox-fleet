@@ -8,13 +8,17 @@
 //! hash-chained central audit log. It never holds provider credentials.
 
 pub mod admin;
+pub mod anchor;
 pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
 pub mod governance;
 pub mod logging;
+pub mod metrics;
+pub mod oidc;
 pub mod problem;
+pub mod ratelimit;
 pub mod routes;
 pub mod server;
 pub mod state;
