@@ -1,3 +1,5 @@
+<img src="docs/assets/logo.svg" width="96" height="96" alt="SendBox Fleet logo">
+
 # sendbox-fleet
 
 Shared governance service for [SendBox](https://github.com/mbianchidev/sendbox) governed sessions: operator-signed policy profiles shared across users and hosts, project-scoped roles, session admission, credential grant authorization and revocation, approved expiring exceptions, and a hash-chained central audit log. It is increment 2 of [mbianchidev/sendbox#87](https://github.com/mbianchidev/sendbox/issues/87).
