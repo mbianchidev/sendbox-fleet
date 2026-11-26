@@ -1,7 +1,7 @@
 # Architecture
 
 `sendbox-fleet` is the shared governance service for SendBox governed sessions
-([mbianchidev/sendbox#87](https://github.com/mbianchidev/sendbox/issues/87)).
+([sendbox-dev/sendbox#87](https://github.com/sendbox-dev/sendbox/issues/87)).
 It is increment 2 of that issue: the authenticated, multi-user management API
 and central authority that increment 1 deliberately left out.
 
@@ -15,7 +15,7 @@ outside the database. See [roadmap.md](roadmap.md) for what remains and
 
 ## Relationship to SendBox increment 1
 
-Increment 1 lives in the [sendbox](https://github.com/mbianchidev/sendbox)
+Increment 1 lives in the [sendbox](https://github.com/sendbox-dev/sendbox)
 repository and works on a single host:
 
 - An operator signs a governance profile (the maximum a session may do). The
@@ -31,7 +31,7 @@ fleet implements the same `GrantAuthority` semantics over HTTP (both use
 `sendbox_governance::evaluate_request`); a SendBox host whose operator
 configuration has a `fleet` section uses its remote authority client instead
 of the local one. See SendBox's
-[shared governance service](https://github.com/mbianchidev/sendbox/blob/main/docs/architecture/governed-sessions.md#shared-governance-service)
+[shared governance service](https://github.com/sendbox-dev/sendbox/blob/main/docs/architecture/governed-sessions.md#shared-governance-service)
 for the host side.
 
 ```mermaid
