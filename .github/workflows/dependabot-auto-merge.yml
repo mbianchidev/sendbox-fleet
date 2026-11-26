@@ -8,7 +8,7 @@ permissions:
 jobs:
   contract-pin:
     name: Auto-merge sendbox contract pin updates
-    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'mbianchidev/sendbox-fleet'
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'sendbox-dev/sendbox-fleet'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

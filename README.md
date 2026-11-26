@@ -2,7 +2,7 @@
 
 # sendbox-fleet
 
-Shared governance service for [SendBox](https://github.com/mbianchidev/sendbox) governed sessions: operator-signed policy profiles shared across users and hosts, project-scoped roles, session admission, credential grant authorization and revocation, approved expiring exceptions, and a hash-chained central audit log. It is increment 2 of [mbianchidev/sendbox#87](https://github.com/mbianchidev/sendbox/issues/87).
+Shared governance service for [SendBox](https://github.com/sendbox-dev/sendbox) governed sessions: operator-signed policy profiles shared across users and hosts, project-scoped roles, session admission, credential grant authorization and revocation, approved expiring exceptions, and a hash-chained central audit log. It is increment 2 of [sendbox-dev/sendbox#87](https://github.com/sendbox-dev/sendbox/issues/87).
 
 Provider credentials never reach this service; they stay in the SendBox host broker.
 
@@ -15,7 +15,7 @@ Feature-complete for increment 2 and usable for team deployments:
 - Hash-chained audit with host-reported request outcomes, signed chain heads, and anchoring outside the database.
 - Operations: PostgreSQL least-privilege roles, rate limits, Prometheus metrics, size and daily log rotation, deployment and backup guidance.
 
-Not yet done: a governed session on Apple or Kata against real model providers through a deployed fleet. That run is host-side work tracked in [mbianchidev/sendbox#96](https://github.com/mbianchidev/sendbox/issues/96). See the [roadmap](docs/roadmap.md).
+Not yet done: a governed session on Apple or Kata against real model providers through a deployed fleet. That run is host-side work tracked in [sendbox-dev/sendbox#96](https://github.com/sendbox-dev/sendbox/issues/96). See the [roadmap](docs/roadmap.md).
 
 ## Quick start
 

@@ -1832,7 +1832,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 [[package]]
 name = "sendbox-core"
 version = "0.2.7"
-source = "git+https://github.com/mbianchidev/sendbox?branch=main#fe05a0d84ca36fbffa3892d7705ee4ba8ed08eb9"
+source = "git+https://github.com/sendbox-dev/sendbox?branch=main#fe05a0d84ca36fbffa3892d7705ee4ba8ed08eb9"
 dependencies = [
  "serde",
 ]
@@ -1840,7 +1840,7 @@ dependencies = [
 [[package]]
 name = "sendbox-governance"
 version = "0.2.7"
-source = "git+https://github.com/mbianchidev/sendbox?branch=main#fe05a0d84ca36fbffa3892d7705ee4ba8ed08eb9"
+source = "git+https://github.com/sendbox-dev/sendbox?branch=main#fe05a0d84ca36fbffa3892d7705ee4ba8ed08eb9"
 dependencies = [
  "sendbox-core",
  "serde",
@@ -1854,7 +1854,7 @@ dependencies = [
 [[package]]
 name = "sendbox-security"
 version = "0.2.7"
-source = "git+https://github.com/mbianchidev/sendbox?branch=main#fe05a0d84ca36fbffa3892d7705ee4ba8ed08eb9"
+source = "git+https://github.com/sendbox-dev/sendbox?branch=main#fe05a0d84ca36fbffa3892d7705ee4ba8ed08eb9"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",

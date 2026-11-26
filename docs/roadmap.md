@@ -1,7 +1,7 @@
 # Roadmap
 
 Increment-2 work for
-[mbianchidev/sendbox#87](https://github.com/mbianchidev/sendbox/issues/87).
+[sendbox-dev/sendbox#87](https://github.com/sendbox-dev/sendbox/issues/87).
 Each item names the issue's acceptance criteria (AC) it serves:
 
 - **AC1** A trusted shared profile is enforced at actual session admission and
@@ -77,7 +77,7 @@ invariants, CI, and these documents. Increment 2 then delivered:
 1. **Live end-to-end runs.** Run Apple and Kata governed sessions against a
    deployed fleet and real model providers. The provider path (broker,
    relay, credential injection) is host-side, so this is tracked in SendBox:
-   [mbianchidev/sendbox#96](https://github.com/mbianchidev/sendbox/issues/96).
+   [sendbox-dev/sendbox#96](https://github.com/sendbox-dev/sendbox/issues/96).
 2. **`RUSTSEC-2026-0459`.** Drop the exception in `.cargo/audit.toml` once an
    sqlx release allows libsqlite3-sys 0.39. It affects only SQLite, which
    production does not use.

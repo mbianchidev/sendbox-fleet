@@ -7,7 +7,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-repo='https://github.com/mbianchidev/sendbox'
+repo='https://github.com/sendbox-dev/sendbox'
 status=0
 
 while IFS= read -r line; do

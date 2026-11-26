@@ -3,7 +3,7 @@
 SendBox hosts and this service must agree byte-for-byte on identities,
 profile references, session bindings, grants, request contexts, and
 decisions. That agreement lives in one crate, `sendbox-governance`, in the
-[sendbox](https://github.com/mbianchidev/sendbox) repository
+[sendbox](https://github.com/sendbox-dev/sendbox) repository
 (`crates/sendbox-governance`). This service depends on it instead of
 redefining any of those types.
 
@@ -11,8 +11,8 @@ redefining any of those types.
 
 ```toml
 # Cargo.toml (workspace)
-sendbox-governance = { git = "https://github.com/mbianchidev/sendbox", branch = "main" }
-sendbox-security = { git = "https://github.com/mbianchidev/sendbox", branch = "main" }
+sendbox-governance = { git = "https://github.com/sendbox-dev/sendbox", branch = "main" }
+sendbox-security = { git = "https://github.com/sendbox-dev/sendbox", branch = "main" }
 ```
 
 `sendbox-security` supplies the signing envelope and trust store used for

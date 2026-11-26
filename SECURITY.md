@@ -1,7 +1,7 @@
 # Security
 
 Please report suspected vulnerabilities privately through
-[GitHub private vulnerability reporting](https://github.com/mbianchidev/sendbox-fleet/security/advisories/new)
+[GitHub private vulnerability reporting](https://github.com/sendbox-dev/sendbox-fleet/security/advisories/new)
 (the repository's **Security** tab, then **Report a vulnerability**). Do not
 open public issues or pull requests for vulnerabilities.
 
